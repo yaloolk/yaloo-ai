@@ -1,0 +1,107 @@
+"""
+app/schemas/payloads.py
+Pydantic models for:
+  - Supabase DB webhook payloads (INSERT / UPDATE events)
+  - FastAPI request / response bodies
+"""
+from __future__ import annotations
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel
+
+
+# ── Supabase DB webhook envelope ────────────────────────────────────────────
+
+class WebhookPayload(BaseModel):
+    """
+    Supabase fires this JSON body to your endpoint on row change.
+    Only `type` and `record` are needed by the embedding service.
+    """
+    type: str                        # "INSERT" | "UPDATE" | "DELETE"
+    table: str
+    schema: str = "public"
+    record: Dict[str, Any]           # the new row
+    old_record: Optional[Dict[str, Any]] = None
+
+
+# ── Recommendation request ───────────────────────────────────────────────────
+
+class RecommendRequest(BaseModel):
+    tourist_id: str
+    city: Optional[str] = None               # filter by city name (case-insensitive)
+    guide_gender: Optional[str] = None       # "male" | "female" | "any"
+    top_k: int = 5
+
+    # ── Availability filter (provided by Django booking backend) ────────────
+    # Django checks the requested date/time slot and returns the IDs of
+    # guides/stays that are free. FastAPI only ranks within this pool.
+    # If None → no availability filter applied (browse mode, no date selected).
+    available_guide_ids: Optional[List[str]] = None
+    available_stay_ids: Optional[List[str]] = None
+
+
+class GuideResult(BaseModel):
+    guide_profile_id: str
+    user_profile_id: str
+    full_name: str
+    city_name: Optional[str]
+    gender: Optional[str]
+    avg_rating: Optional[float]
+    experience_years: Optional[int]
+    rate_per_hour: Optional[float]
+    specializations: Optional[str]
+    languages: Optional[str]
+    profile_bio: Optional[str]
+    vec_sim: float
+    final_score: float
+
+
+class StayResult(BaseModel):
+    stay_id: str
+    name: str
+    type: Optional[str]
+    city_name: Optional[str]
+    description: Optional[str]
+    budget: Optional[str]
+    price_per_night: Optional[float]
+    ambiance: Optional[str]
+    suitable_for: Optional[str]
+    avg_rating: Optional[float]
+    vec_sim: float
+    final_score: float
+
+
+class ActivityResult(BaseModel):
+    activity_id: str
+    name: str
+    category: Optional[str]
+    description: Optional[str]
+    budget: Optional[str]
+    difficulty_level: Optional[str]
+    base_price: Optional[float]
+    suitable_for: Optional[str]
+    vec_sim: float
+    final_score: float
+
+
+class RecommendResponse(BaseModel):
+    tourist_id: str
+    guides: List[GuideResult]
+    stays: List[StayResult]
+    activities: List[ActivityResult]
+
+
+# ── Chat ────────────────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role: str    # "user" | "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    tourist_id: Optional[str] = None
+    messages: List[ChatMessage]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    sources: List[str] = []
