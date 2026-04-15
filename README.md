@@ -23,16 +23,21 @@ yaloo_ai/
 ├── sql/
 │   ├── 01_add_embeddings.sql  # pgvector migration — run first
 │   └── 02_rpc_functions.sql   # KNN helper functions — run second
+|   └── 03_doc_rag.sql         # pg vector migration & KNN helper functions for yaloo document rag— run second
+|
 ├── scripts/
 │   └── embed_all.py           # one-shot backfill
-├── docs/                      # Yaloo policy / FAQ text files for chatbot RAG
+|   └── embed_doc.py           # one-shot backfill for document embedding
+|
 ├── requirements.txt
 └── .env.example
+
+├── docs/                      # Yaloo policy / FAQ text files for chatbot RAG is removed from above stack since we changed the method for doc rag
 ```
 
 ## Setup
 
-1. **SQL migration** — run `sql/01_add_embeddings.sql` then `sql/02_rpc_functions.sql` in Supabase SQL editor.
+1. **SQL migration** — run `sql/01_add_embeddings.sql` then `sql/02_rpc_functions.sql` then `sql/03_doc_rag.sql` in Supabase SQL editor.
 
 2. **Environment**
    ```bash
@@ -48,6 +53,7 @@ yaloo_ai/
 4. **Backfill existing data**
    ```bash
    python -m scripts.embed_all
+   python -m scripts.embed_doc
    ```
 
 5. **Run**
@@ -69,12 +75,4 @@ In Supabase Dashboard → Database → Webhooks, create:
 
 Set header: `x-webhook-secret: YOUR_SECRET` (matches `SUPABASE_WEBHOOK_SECRET` in .env).
 
-## Chatbot docs
 
-Place `.txt` or `.md` files in `docs/` for the chatbot to use:
-- `docs/platform_overview.md`
-- `docs/booking_policy.md`
-- `docs/guide_standards.md`
-- `docs/homestay_standards.md`
-- `docs/faq.md`
-- `docs/sri_lanka_travel_tips.md`
