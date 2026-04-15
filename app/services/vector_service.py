@@ -480,7 +480,7 @@ def upsert_tourist_embedding(tourist_profile_id: str) -> Dict[str, List[float]]:
     # (they share the same base text, only the bridge suffix differs).
     # If you want to cache all three, add svector_stay / svector_activity columns.
     get_supabase().table("tourist_profile").update(
-        {"svector": vec_guide}
+        {"tourist_svector": vec_guide}
     ).eq("id", tourist_profile_id).execute()
 
     log.info("Tourist %s embedded (3 variants)", tourist_profile_id)
@@ -497,6 +497,6 @@ def invalidate_tourist_embedding(tourist_profile_id: str) -> None:
     Nulls out the cached vector so the next /recommend request recomputes it.
     """
     get_supabase().table("tourist_profile").update(
-        {"svector": None}
+        {"tourist_svector": None}
     ).eq("id", tourist_profile_id).execute()
-    log.info("Tourist %s svector invalidated", tourist_profile_id)
+    log.info("Tourist %s tourist_svector invalidated", tourist_profile_id)

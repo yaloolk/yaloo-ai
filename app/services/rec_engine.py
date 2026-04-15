@@ -226,7 +226,7 @@ def _get_tourist_vectors(tourist_id: str) -> Dict[str, List[float]]:
     db = get_supabase()
     row = (
         db.table("tourist_profile")
-        .select("id, user_profile_id, travel_style, budget, active_level, svector")
+        .select("id, user_profile_id, travel_style, budget, active_level, tourist_svector")
         .eq("id", tourist_id)
         .single()
         .execute()
@@ -235,12 +235,12 @@ def _get_tourist_vectors(tourist_id: str) -> Dict[str, List[float]]:
     if not row:
         raise ValueError(f"tourist_profile not found: {tourist_id}")
 
-    if row.get("svector"):
+    if row.get("tourist_svector"):
         from app.services.vector_service import fetch_tourist_row
         tourist_row = fetch_tourist_row(tourist_id)
         if tourist_row:
             return {
-                "guide":    row["svector"],
+                "guide":    row["tourist_svector"],
                 "stay":     embed(tourist_text_for_stay(tourist_row)),
                 "activity": embed(tourist_text_for_activity(tourist_row)),
             }

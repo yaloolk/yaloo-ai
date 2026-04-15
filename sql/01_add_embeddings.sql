@@ -20,9 +20,9 @@ ALTER TABLE activity
 
 -- tourist_svector already exists in your schema (confirmed in CSV)
 -- but it may be text/null — re-create as proper vector type if needed.
--- Safe approach: add a new column and migrate later if type is wrong.
+-- If it already exists as vector(768) this is a safe no-op.
 ALTER TABLE tourist_profile
-    ADD COLUMN IF NOT EXISTS svector vector(768);
+    ADD COLUMN IF NOT EXISTS tourist_svector vector(768);
 
 -- 3. HNSW indexes for fast cosine-similarity KNN search
 --    hnsw is faster at query time than ivfflat for small-medium datasets
@@ -44,7 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_activity_embedding
 
 CREATE INDEX IF NOT EXISTS idx_tourist_svector
     ON tourist_profile
-    USING hnsw (svector vector_cosine_ops)
+    USING hnsw (tourist_svector vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
 -- ============================================================
