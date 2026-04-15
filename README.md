@@ -1,3 +1,13 @@
+---
+title: Yaloo AI Recommendation System
+emoji: 🌍
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+---
+
+
 # Yaloo AI
 
 Recommendation engine + chatbot for the Yaloo community tourism platform.
