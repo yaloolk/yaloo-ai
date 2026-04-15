@@ -35,7 +35,7 @@ def _get_gemini():
     if not s.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
     genai.configure(api_key=s.gemini_api_key)
-    return genai.GenerativeModel("gemini-1.5-flash")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 
 # ── Step 1: Intent classification ────────────────────────────────────────────
