@@ -390,7 +390,7 @@ async def invalidate_tourist(
       Table: user_interest | Events: INSERT, DELETE
       Table: user_language | Events: INSERT, DELETE
     What changed: tourist added/removed an interest or language
-    Action: null out svector so next /recommend call recomputes it fresh
+    Action: null out t2g, t2s, t2a embeddings so next /recommend call recomputes it fresh
     Note: these same tables also trigger /embed/guide/by-user.
     """
     _verify(x_webhook_secret)
@@ -540,6 +540,8 @@ async def get_recommendations(req: RecommendRequest):
             city=req.city,
             guide_gender=req.guide_gender,
             top_k=req.top_k,
+            available_guide_ids=req.available_guide_ids,
+            available_stay_ids=req.available_stay_ids,
         )
         return result
     except ValueError as e:

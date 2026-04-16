@@ -1,58 +1,20 @@
 -- ============================================================
--- Yaloo AI — exec_sql RPC helper
--- Run this in Supabase SQL editor AFTER the migration script.
---
--- This gives rec_engine.py a way to run parameterised KNN queries
--- that the Supabase PostgREST API can't express natively
--- (pgvector ORDER BY embedding <=> $vec isn't supported in the
--- PostgREST query builder).
---
--- Security: this function uses SECURITY DEFINER with a restricted
--- search_path.  Only call it from your service-role key (server-side).
--- Never expose it to the anon/authenticated roles via RLS.
--- ============================================================
-
--- ============================================================
--- exec_sql has been intentionally omitted.
---
--- A generic exec_sql(query text) function accepts arbitrary SQL,
--- giving any caller who holds the service-role key full database
--- access. Even with the service role restricted to server-side code,
--- a compromised backend would hand an attacker unrestricted query
--- power.
---
--- Instead, every query is expressed as a typed function below.
--- Each function accepts only the specific parameters it needs.
--- Postgres enforces the types — no string interpolation, no
--- injection surface, no surprise queries.
---
--- If you previously ran a version of this file that created exec_sql,
--- drop it now:
+-- Yaloo AI — typed RPC functions (final)
+-- Run AFTER 01_add_embeddings.sql
+-- exec_sql is intentionally absent — use typed functions only.
+-- If you previously created exec_sql, drop it:
 --   DROP FUNCTION IF EXISTS exec_sql(text);
 -- ============================================================
 
 -- ============================================================
 -- match_guides
---
--- available_ids  uuid[]  DEFAULT NULL
---   NULL  → browse mode. Uses is_available flag on guide_profile.
---   '{}'  → empty array means no guides free — returns 0 rows fast.
---   '{id1,id2,...}' → only rank within this confirmed-available pool.
---           Django booking backend passes this after checking the
---           tourist's requested date/time slot.
---
--- "less matches" behaviour:
---   If only 2 guides are in available_ids, you get 2 back — not top_k.
---   FastAPI never pads with unavailable guides. Mobile app should
---   handle a shorter-than-expected list gracefully.
 -- ============================================================
-
 CREATE OR REPLACE FUNCTION match_guides(
     query_embedding  vector(768),
     city_filter      text     DEFAULT NULL,
     gender_filter    text     DEFAULT NULL,
     match_count      int      DEFAULT 15,
-    available_ids    uuid[]   DEFAULT NULL   -- NULL = browse mode
+    available_ids    uuid[]   DEFAULT NULL
 )
 RETURNS TABLE (
     guide_profile_id uuid,
@@ -67,9 +29,7 @@ RETURNS TABLE (
     city_name        text,
     vec_sim          float
 )
-LANGUAGE sql
-STABLE
-AS $$
+LANGUAGE sql STABLE AS $$
     SELECT
         gp.id,
         gp.user_profile_id,
@@ -78,7 +38,7 @@ AS $$
         gp.rate_per_hour,
         gp.active_level,
         up.first_name || ' ' || up.last_name,
-        up.gender,
+        up.gender::text,
         up.profile_bio,
         c.name,
         1 - (gp.embedding <=> query_embedding)
@@ -87,26 +47,20 @@ AS $$
     JOIN city           c ON c.id  = gp.city_id
     WHERE gp.embedding IS NOT NULL
       AND up.profile_status = 'active'
-      -- Availability: use provided pool OR fall back to coarse flag
       AND (
-            available_ids IS NOT NULL
-            AND gp.id = ANY(available_ids)          -- time-slot search
-          OR
-            available_ids IS NULL
-            AND gp.is_available = true              -- browse mode
+            (available_ids IS NOT NULL AND gp.id = ANY(available_ids))
+            OR
+            (available_ids IS NULL AND gp.is_available = true)
       )
-      AND (city_filter IS NULL OR c.name ILIKE city_filter)
+      AND (city_filter   IS NULL OR c.name ILIKE city_filter)
       AND (gender_filter IS NULL OR gender_filter = 'any' OR up.gender::text = gender_filter)
     ORDER BY gp.embedding <=> query_embedding
     LIMIT match_count;
 $$;
 
-
 -- ============================================================
 -- match_stays
--- Same available_ids logic as match_guides.
 -- ============================================================
-
 CREATE OR REPLACE FUNCTION match_stays(
     query_embedding  vector(768),
     city_filter      text     DEFAULT NULL,
@@ -124,9 +78,7 @@ RETURNS TABLE (
     avg_rating       float,
     vec_sim          float
 )
-LANGUAGE sql
-STABLE
-AS $$
+LANGUAGE sql STABLE AS $$
     SELECT
         s.id,
         s.name,
@@ -139,21 +91,21 @@ AS $$
         1 - (s.embedding <=> query_embedding)
     FROM stay s
     JOIN city c ON c.id = s.city_id
-    LEFT JOIN host_profile hp ON hp.user_profile_id = s.host_id
+    LEFT JOIN host_profile hp ON hp.id = s.host_id
     WHERE s.embedding IS NOT NULL
       AND (
-            available_ids IS NOT NULL
-            AND s.id = ANY(available_ids)
-          OR
-            available_ids IS NULL
-            AND s.is_active = true
+            (available_ids IS NOT NULL AND s.id = ANY(available_ids))
+            OR
+            (available_ids IS NULL AND s.is_active = true)
       )
       AND (city_filter IS NULL OR c.name ILIKE city_filter)
     ORDER BY s.embedding <=> query_embedding
     LIMIT match_count;
 $$;
 
-
+-- ============================================================
+-- match_activities
+-- ============================================================
 CREATE OR REPLACE FUNCTION match_activities(
     query_embedding vector(768),
     match_count     int DEFAULT 15
@@ -168,9 +120,7 @@ RETURNS TABLE (
     base_price       float,
     vec_sim          float
 )
-LANGUAGE sql
-STABLE
-AS $$
+LANGUAGE sql STABLE AS $$
     SELECT
         a.id,
         a.name,
@@ -183,5 +133,35 @@ AS $$
     FROM activity a
     WHERE a.embedding IS NOT NULL AND a.is_active = true
     ORDER BY a.embedding <=> query_embedding
+    LIMIT match_count;
+$$;
+
+-- ============================================================
+-- match_doc_chunks
+-- Used by chatbot RAG to find relevant Yaloo policy/FAQ chunks
+-- ============================================================
+CREATE OR REPLACE FUNCTION match_doc_chunks(
+    query_embedding  vector(768),
+    category_filter  text  DEFAULT NULL,
+    match_count      int   DEFAULT 4
+)
+RETURNS TABLE (
+    chunk_id    uuid,
+    doc_name    text,
+    category    text,
+    content     text,
+    vec_sim     float
+)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        dc.id,
+        dc.doc_name,
+        dc.category,
+        dc.content,
+        1 - (dc.embedding <=> query_embedding)
+    FROM doc_chunk dc
+    WHERE dc.embedding IS NOT NULL
+      AND (category_filter IS NULL OR dc.category = category_filter)
+    ORDER BY dc.embedding <=> query_embedding
     LIMIT match_count;
 $$;

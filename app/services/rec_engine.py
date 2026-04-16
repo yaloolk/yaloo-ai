@@ -3,24 +3,18 @@ app/services/rec_engine.py
 
 Recommendation engine — pgvector edition, typed-RPC-only.
 
-exec_sql has been removed entirely. All KNN queries go through the
-typed match_guides / match_stays / match_activities Postgres functions
-defined in sql/02_rpc_functions.sql. Those functions accept only the
-specific parameters they need — no arbitrary SQL can be injected.
+Tourist embedding columns (three separate vectors):
+  t2g_embedding  → used when querying guides
+  t2s_embedding  → used when querying stays
+  t2a_embedding  → used when querying activities
 
-Scoring (identical to notebook):
+All three are stored in tourist_profile and read together on each
+/recommend call. If any is NULL the full set is recomputed atomically.
+
+Scoring:
   Guides     : final = vec_sim                          (pure cosine)
   Stays      : final = 0.80*vec_sim + 0.12*budget_bonus
   Activities : final = 0.80*vec_sim + 0.12*budget_bonus + 0.08*active_bonus
-
-Hard filters (enforced inside Postgres functions, not in Python):
-  city            : guides, stays
-  gender          : guides only
-  available_ids   : guides, stays (from Django booking backend)
-
-Soft bonuses (applied in Python after results arrive):
-  budget_bonus : 1.0 exact tier, 0.5 one tier apart, 0.0 two+ tiers
-  active_bonus : 1.0 if difficulty in tourist's compatible set, else 0.0
 """
 from __future__ import annotations
 
@@ -29,12 +23,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.config import get_settings
 from app.core.database import get_supabase
-from app.services.vector_service import upsert_tourist_embedding, embed
-from app.services.text_builder import (
-    tourist_text_for_guide,
-    tourist_text_for_stay,
-    tourist_text_for_activity,
-)
+from app.services.vector_service import upsert_tourist_embedding
 from app.schemas.payloads import GuideResult, StayResult, ActivityResult, RecommendResponse
 
 log = logging.getLogger(__name__)
@@ -72,13 +61,6 @@ def _active_bonus(tourist_active: str, item_difficulty: str) -> float:
 
 
 # ── Typed RPC KNN helpers ─────────────────────────────────────────────────────
-#
-# Each function calls its dedicated Postgres function by name with typed
-# parameters. Postgres receives a vector(768), not a raw SQL string.
-# No SQL injection is possible — the function signature is fixed in the DB.
-#
-# The Supabase Python client serialises List[float] → PostgreSQL vector
-# automatically when the target RPC parameter type is vector(768).
 
 def _knn_guides(
     vec: List[float],
@@ -87,28 +69,15 @@ def _knn_guides(
     n: int,
     available_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Calls match_guides() in Postgres — no raw SQL leaves Python.
-
-    available_ids behaviour:
-      None      → browse mode, Postgres uses is_available flag.
-      [id, ...] → only rank within this confirmed-available pool.
-      []        → short-circuits here, DB never called.
-    """
     if available_ids is not None and len(available_ids) == 0:
         return []
-
-    params: Dict[str, Any] = {
-        "query_embedding": vec,
-        "match_count":     n * 3,
-    }
+    params: Dict[str, Any] = {"query_embedding": vec, "match_count": n * 3}
     if city:
         params["city_filter"] = city
     if gender and gender.lower() not in ("any", ""):
         params["gender_filter"] = gender.lower()
     if available_ids is not None:
         params["available_ids"] = available_ids
-
     result = get_supabase().rpc("match_guides", params).execute()
     return result.data or []
 
@@ -119,28 +88,18 @@ def _knn_stays(
     n: int,
     available_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Calls match_stays() in Postgres. Same availability logic as guides."""
     if available_ids is not None and len(available_ids) == 0:
         return []
-
-    params: Dict[str, Any] = {
-        "query_embedding": vec,
-        "match_count":     n * 3,
-    }
+    params: Dict[str, Any] = {"query_embedding": vec, "match_count": n * 3}
     if city:
         params["city_filter"] = city
     if available_ids is not None:
         params["available_ids"] = available_ids
-
     result = get_supabase().rpc("match_stays", params).execute()
     return result.data or []
 
 
 def _knn_activities(vec: List[float], n: int) -> List[Dict[str, Any]]:
-    """
-    Calls match_activities() in Postgres.
-    Activities are not time-slot booked so there is no availability filter.
-    """
     result = get_supabase().rpc(
         "match_activities",
         {"query_embedding": vec, "match_count": n * 3},
@@ -148,23 +107,18 @@ def _knn_activities(vec: List[float], n: int) -> List[Dict[str, Any]]:
     return result.data or []
 
 
-# ── Entity label helpers (fetched after KNN, for display only) ────────────────
+# ── Entity label helpers ──────────────────────────────────────────────────────
 
 def _get_stay_labels(stay_id: str) -> Dict[str, str]:
     db = get_supabase()
-
-    amb_rows = (
-        db.table("stay_ambiance").select("ambiance_id").eq("stay_id", stay_id).execute()
-    ).data or []
+    amb_rows = db.table("stay_ambiance").select("ambiance_id").eq("stay_id", stay_id).execute().data or []
     amb_ids = [r["ambiance_id"] for r in amb_rows]
     ambiance = ""
     if amb_ids:
         rows = db.table("ambiance").select("label").in_("id", amb_ids).execute().data or []
         ambiance = ", ".join(r["label"] for r in rows)
 
-    sf_rows = (
-        db.table("stay_suitable_for").select("suitable_for_id").eq("stay_id", stay_id).execute()
-    ).data or []
+    sf_rows = db.table("stay_suitable_for").select("suitable_for_id").eq("stay_id", stay_id).execute().data or []
     sf_ids = [r["suitable_for_id"] for r in sf_rows]
     suitable_for = ""
     if sf_ids:
@@ -176,12 +130,7 @@ def _get_stay_labels(stay_id: str) -> Dict[str, str]:
 
 def _get_activity_labels(activity_id: str) -> str:
     db = get_supabase()
-    sf_rows = (
-        db.table("activity_suitable_for")
-        .select("suitable_for_id")
-        .eq("activity_id", activity_id)
-        .execute()
-    ).data or []
+    sf_rows = db.table("activity_suitable_for").select("suitable_for_id").eq("activity_id", activity_id).execute().data or []
     sf_ids = [r["suitable_for_id"] for r in sf_rows]
     if not sf_ids:
         return ""
@@ -191,19 +140,14 @@ def _get_activity_labels(activity_id: str) -> str:
 
 def _get_guide_labels(user_profile_id: str) -> Dict[str, str]:
     db = get_supabase()
-
-    int_rows = (
-        db.table("user_interest").select("interest_id").eq("user_profile_id", user_profile_id).execute()
-    ).data or []
+    int_rows = db.table("user_interest").select("interest_id").eq("user_profile_id", user_profile_id).execute().data or []
     int_ids = [r["interest_id"] for r in int_rows]
     interests = ""
     if int_ids:
         rows = db.table("interest").select("name").in_("id", int_ids).execute().data or []
         interests = ", ".join(r["name"] for r in rows)
 
-    lang_rows = (
-        db.table("user_language").select("language_id").eq("user_profile_id", user_profile_id).execute()
-    ).data or []
+    lang_rows = db.table("user_language").select("language_id").eq("user_profile_id", user_profile_id).execute().data or []
     lang_ids = [r["language_id"] for r in lang_rows]
     languages = ""
     if lang_ids:
@@ -217,16 +161,14 @@ def _get_guide_labels(user_profile_id: str) -> Dict[str, str]:
 
 def _get_tourist_vectors(tourist_id: str) -> Dict[str, List[float]]:
     """
+    Read all three cached vectors from tourist_profile.
+    If ANY is NULL → recompute and store all three atomically.
     Returns {"guide": [...], "stay": [...], "activity": [...]}
-
-    Reads svector from tourist_profile (cached guide-query vector).
-    If cached: recomputes stay/activity bridge variants from text (cheap).
-    If NULL: computes all three variants, caches guide vector, returns all.
     """
     db = get_supabase()
     row = (
         db.table("tourist_profile")
-        .select("id, user_profile_id, travel_style, budget, active_level, tourist_svector")
+        .select("id, t2g_embedding, t2s_embedding, t2a_embedding")
         .eq("id", tourist_id)
         .single()
         .execute()
@@ -235,16 +177,16 @@ def _get_tourist_vectors(tourist_id: str) -> Dict[str, List[float]]:
     if not row:
         raise ValueError(f"tourist_profile not found: {tourist_id}")
 
-    if row.get("tourist_svector"):
-        from app.services.vector_service import fetch_tourist_row
-        tourist_row = fetch_tourist_row(tourist_id)
-        if tourist_row:
-            return {
-                "guide":    row["tourist_svector"],
-                "stay":     embed(tourist_text_for_stay(tourist_row)),
-                "activity": embed(tourist_text_for_activity(tourist_row)),
-            }
+    t2g = row.get("t2g_embedding")
+    t2s = row.get("t2s_embedding")
+    t2a = row.get("t2a_embedding")
 
+    # If all three are cached, return them directly — zero embed calls
+    if t2g and t2s and t2a:
+        return {"guide": t2g, "stay": t2s, "activity": t2a}
+
+    # Any column is NULL → recompute all three and store atomically
+    log.info("Tourist %s: missing vectors, recomputing all three", tourist_id)
     return upsert_tourist_embedding(tourist_id)
 
 
@@ -260,13 +202,7 @@ def recommend(
 ) -> RecommendResponse:
     """
     Main entry point — called by POST /recommend.
-
-    Availability flow
-    -----------------
-    Django checks the tourist's requested date/time slot and returns
-    available_guide_ids and available_stay_ids. FastAPI ranks only within
-    those confirmed-available pools. If both are None, browse mode applies
-    (no date selected — coarse is_available / is_active flags used instead).
+    Reads t2g/t2s/t2a vectors from tourist_profile (or recomputes if NULL).
     """
     db = get_supabase()
 

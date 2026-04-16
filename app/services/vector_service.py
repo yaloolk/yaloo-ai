@@ -3,17 +3,21 @@ app/services/vector_service.py
 
 Responsibilities:
   1. Load the HuggingFace embedding model once at startup (singleton).
-  2. Fetch enriched entity rows from Supabase (joining related tables
-     so the text builder has all the fields it needs).
-  3. Compute embeddings and upsert them back into Supabase via pgvector.
+  2. Fetch enriched entity rows from Supabase (joining related tables).
+  3. Compute embeddings and upsert them back into Supabase.
 
-Called by:
-  - app/api/recommend.py   (webhook endpoints)
-  - scripts/embed_all.py   (one-shot backfill)
+Tourist embedding columns (three separate, one per query target):
+  t2g_embedding  — tourist-to-guide query vector
+  t2s_embedding  — tourist-to-stay query vector
+  t2a_embedding  — tourist-to-activity query vector
+
+All three are stored and kept in sync together. No lazy computation —
+all three are written atomically on every tourist embed call.
 """
 from __future__ import annotations
 
 import logging
+import time
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -37,10 +41,6 @@ log = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def get_embedding_model() -> HuggingFaceEmbeddings:
-    """
-    Loaded once per process.  First call is slow (~10-30s download on cold
-    VPS); every subsequent call returns the cached instance instantly.
-    """
     s = get_settings()
     log.info("Loading embedding model %s on %s …", s.embedding_model, s.embedding_device)
     model = HuggingFaceEmbeddings(
@@ -62,23 +62,18 @@ def embed_batch(texts: List[str]) -> List[List[float]]:
     return get_embedding_model().embed_documents(texts)
 
 
-# ── Supabase data fetchers ────────────────────────────────────────────────────
-# Each fetcher returns a dict with all fields the text builder expects,
-# including pre-joined related tables (interests, specializations, etc.)
+# ── Shared label helper ───────────────────────────────────────────────────────
 
 def _join_labels(rows: List[Dict], label_key: str, sep: str = ", ") -> str:
     return sep.join(r[label_key] for r in rows if r.get(label_key))
 
 
+# ── Data fetchers ─────────────────────────────────────────────────────────────
+
 def fetch_guide_row(guide_profile_id: str) -> Optional[Dict[str, Any]]:
     """
-    Joins:
-      guide_profile → user_profile (bio, gender, active_level)
-      guide_profile → city (city name)
-      guide_specialization → specialization (labels)
-      user_interest → interest (labels)
-      user_language → language (names)
-      local_activity → activity (names) — weight-1 field
+    Joins: guide_profile → user_profile, city, specializations,
+           interests, languages, local_activities (weight-1)
     """
     db = get_supabase()
 
@@ -108,7 +103,6 @@ def fetch_guide_row(guide_profile_id: str) -> Optional[Dict[str, Any]]:
         .execute()
     ).data or {}
 
-    # specializations
     spec_joins = (
         db.table("guide_specialization")
         .select("specialization_id")
@@ -118,15 +112,9 @@ def fetch_guide_row(guide_profile_id: str) -> Optional[Dict[str, Any]]:
     spec_ids = [r["specialization_id"] for r in spec_joins]
     specializations = ""
     if spec_ids:
-        spec_rows = (
-            db.table("specialization")
-            .select("label")
-            .in_("id", spec_ids)
-            .execute()
-        ).data or []
-        specializations = _join_labels(spec_rows, "label")
+        rows = db.table("specialization").select("label").in_("id", spec_ids).execute().data or []
+        specializations = _join_labels(rows, "label")
 
-    # interests
     int_joins = (
         db.table("user_interest")
         .select("interest_id")
@@ -136,15 +124,9 @@ def fetch_guide_row(guide_profile_id: str) -> Optional[Dict[str, Any]]:
     int_ids = [r["interest_id"] for r in int_joins]
     interests = ""
     if int_ids:
-        int_rows = (
-            db.table("interest")
-            .select("name")
-            .in_("id", int_ids)
-            .execute()
-        ).data or []
-        interests = _join_labels(int_rows, "name")
+        rows = db.table("interest").select("name").in_("id", int_ids).execute().data or []
+        interests = _join_labels(rows, "name")
 
-    # languages
     lang_joins = (
         db.table("user_language")
         .select("language_id")
@@ -154,57 +136,47 @@ def fetch_guide_row(guide_profile_id: str) -> Optional[Dict[str, Any]]:
     lang_ids = [r["language_id"] for r in lang_joins]
     languages = ""
     if lang_ids:
-        lang_rows = (
-            db.table("language")
-            .select("name")
-            .in_("id", lang_ids)
-            .execute()
-        ).data or []
-        languages = _join_labels(lang_rows, "name")
+        rows = db.table("language").select("name").in_("id", lang_ids).execute().data or []
+        languages = _join_labels(rows, "name")
 
-    # local_activities offered by this guide (weight-1 enrichment)
+    # local_activities this guide personally offers (weight-1 enrichment)
     la_rows = (
         db.table("local_activity")
-        .select("activity_id, special_note")
+        .select("activity_id")
         .eq("guide_id", guide_profile_id)
         .execute()
     ).data or []
-    la_activity_ids = [r["activity_id"] for r in la_rows]
+    la_ids = [r["activity_id"] for r in la_rows]
     local_activities = ""
-    if la_activity_ids:
-        act_rows = (
-            db.table("activity")
-            .select("name")
-            .in_("id", la_activity_ids)
-            .execute()
-        ).data or []
-        local_activities = _join_labels(act_rows, "name")
+    if la_ids:
+        rows = db.table("activity").select("name").in_("id", la_ids).execute().data or []
+        local_activities = _join_labels(rows, "name")
 
     return {
         "guide_profile_id": guide_profile_id,
-        "user_profile_id": gp["user_profile_id"],
-        "full_name": f"{up.get('first_name','')} {up.get('last_name','')}".strip(),
-        "gender": up.get("gender"),
-        "profile_bio": up.get("profile_bio"),
-        "city_name": city.get("name"),
+        "user_profile_id":  gp["user_profile_id"],
+        "full_name":        f"{up.get('first_name','')} {up.get('last_name','')}".strip(),
+        "gender":           up.get("gender"),
+        "profile_bio":      up.get("profile_bio"),
+        "city_name":        city.get("name"),
         "experience_years": gp.get("experience_years"),
-        "avg_rating": gp.get("avg_rating"),
-        "rate_per_hour": gp.get("rate_per_hour"),
-        "active_level": gp.get("active_level"),
-        "specializations": specializations,
-        "interests": interests,
-        "languages": languages,
+        "avg_rating":       gp.get("avg_rating"),
+        "rate_per_hour":    gp.get("rate_per_hour"),
+        "active_level":     gp.get("active_level"),
+        "specializations":  specializations,
+        "interests":        interests,
+        "languages":        languages,
         "local_activities": local_activities,
     }
 
 
 def fetch_stay_row(stay_id: str) -> Optional[Dict[str, Any]]:
     """
-    Joins:
-      stay → city (name)
-      stay_ambiance → ambiance (labels)
-      stay_suitable_for → suitable_for (labels)
-      local_activity (via host_id) → activity (names) — weight-1 enrichment
+    Joins: stay → city, host_profile (avg_rating),
+           stay_ambiance, stay_suitable_for, local_activities (weight-1)
+
+    IMPORTANT: stay.host_id = host_profile.id  (NOT user_profile_id)
+    host_profile query uses .eq("id", stay["host_id"])
     """
     db = get_supabase()
 
@@ -226,12 +198,12 @@ def fetch_stay_row(stay_id: str) -> Optional[Dict[str, Any]]:
         .execute()
     ).data or {}
 
-    # host's avg_rating from host_profile
+    # stay.host_id = host_profile.id  (not user_profile_id — confirmed from CSV)
     hp = (
         db.table("host_profile")
         .select("avg_rating")
-        .eq("user_profile_id", stay["host_id"])
-        .single()
+        .eq("id", stay["host_id"])
+        .maybe_single()
         .execute()
     ).data or {}
 
@@ -244,13 +216,8 @@ def fetch_stay_row(stay_id: str) -> Optional[Dict[str, Any]]:
     amb_ids = [r["ambiance_id"] for r in amb_joins]
     ambiance = ""
     if amb_ids:
-        amb_rows = (
-            db.table("ambiance")
-            .select("label")
-            .in_("id", amb_ids)
-            .execute()
-        ).data or []
-        ambiance = _join_labels(amb_rows, "label")
+        rows = db.table("ambiance").select("label").in_("id", amb_ids).execute().data or []
+        ambiance = _join_labels(rows, "label")
 
     sf_joins = (
         db.table("stay_suitable_for")
@@ -261,51 +228,40 @@ def fetch_stay_row(stay_id: str) -> Optional[Dict[str, Any]]:
     sf_ids = [r["suitable_for_id"] for r in sf_joins]
     suitable_for = ""
     if sf_ids:
-        sf_rows = (
-            db.table("suitable_for")
-            .select("label")
-            .in_("id", sf_ids)
-            .execute()
-        ).data or []
-        suitable_for = _join_labels(sf_rows, "label")
+        rows = db.table("suitable_for").select("label").in_("id", sf_ids).execute().data or []
+        suitable_for = _join_labels(rows, "label")
 
-    # local activities offered by this host (weight-1 enrichment)
+    # local_activities offered by this host (weight-1 enrichment)
+    # stay.host_id = host_profile.id, local_activity.host_id = host_profile.id
     la_rows = (
         db.table("local_activity")
         .select("activity_id")
         .eq("host_id", stay["host_id"])
         .execute()
     ).data or []
-    la_act_ids = [r["activity_id"] for r in la_rows]
+    la_ids = [r["activity_id"] for r in la_rows]
     local_activities = ""
-    if la_act_ids:
-        act_rows = (
-            db.table("activity")
-            .select("name")
-            .in_("id", la_act_ids)
-            .execute()
-        ).data or []
-        local_activities = _join_labels(act_rows, "name")
+    if la_ids:
+        rows = db.table("activity").select("name").in_("id", la_ids).execute().data or []
+        local_activities = _join_labels(rows, "name")
 
     return {
-        "stay_id": stay_id,
-        "name": stay.get("name"),
-        "type": stay.get("type"),
-        "description": stay.get("description"),
-        "budget": stay.get("budget"),
-        "price_per_night": stay.get("price_per_night"),
-        "city_name": city.get("name"),
-        "avg_rating": hp.get("avg_rating"),
-        "ambiance": ambiance,
-        "suitable_for": suitable_for,
+        "stay_id":          stay_id,
+        "name":             stay.get("name"),
+        "type":             stay.get("type"),
+        "description":      stay.get("description"),
+        "budget":           stay.get("budget"),
+        "price_per_night":  stay.get("price_per_night"),
+        "city_name":        city.get("name"),
+        "avg_rating":       hp.get("avg_rating"),
+        "ambiance":         ambiance,
+        "suitable_for":     suitable_for,
         "local_activities": local_activities,
     }
 
 
 def fetch_activity_row(activity_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Global activity with suitable_for labels joined.
-    """
+    """Global activity with suitable_for labels joined."""
     db = get_supabase()
 
     act = (
@@ -327,31 +283,23 @@ def fetch_activity_row(activity_id: str) -> Optional[Dict[str, Any]]:
     sf_ids = [r["suitable_for_id"] for r in sf_joins]
     suitable_for = ""
     if sf_ids:
-        sf_rows = (
-            db.table("suitable_for")
-            .select("label")
-            .in_("id", sf_ids)
-            .execute()
-        ).data or []
-        suitable_for = _join_labels(sf_rows, "label")
+        rows = db.table("suitable_for").select("label").in_("id", sf_ids).execute().data or []
+        suitable_for = _join_labels(rows, "label")
 
     return {
-        "activity_id": activity_id,
-        "name": act.get("name"),
-        "category": act.get("category"),
-        "description": act.get("description"),
-        "budget": act.get("budget"),
+        "activity_id":     activity_id,
+        "name":            act.get("name"),
+        "category":        act.get("category"),
+        "description":     act.get("description"),
+        "budget":          act.get("budget"),
         "difficulty_level": act.get("difficulty_level"),
-        "base_price": act.get("base_price"),
-        "suitable_for": suitable_for,
+        "base_price":      act.get("base_price"),
+        "suitable_for":    suitable_for,
     }
 
 
 def fetch_tourist_row(tourist_profile_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Tourist data flattened for embedding.
-    tourist_id here is the tourist_profile.id (not user_profile.id).
-    """
+    """Tourist data flattened — used by text_builder to produce all 3 query texts."""
     db = get_supabase()
 
     tp = (
@@ -381,13 +329,8 @@ def fetch_tourist_row(tourist_profile_id: str) -> Optional[Dict[str, Any]]:
     int_ids = [r["interest_id"] for r in int_joins]
     interests = ""
     if int_ids:
-        int_rows = (
-            db.table("interest")
-            .select("name")
-            .in_("id", int_ids)
-            .execute()
-        ).data or []
-        interests = _join_labels(int_rows, "name")
+        rows = db.table("interest").select("name").in_("id", int_ids).execute().data or []
+        interests = _join_labels(rows, "name")
 
     lang_joins = (
         db.table("user_language")
@@ -398,30 +341,24 @@ def fetch_tourist_row(tourist_profile_id: str) -> Optional[Dict[str, Any]]:
     lang_ids = [r["language_id"] for r in lang_joins]
     languages = ""
     if lang_ids:
-        lang_rows = (
-            db.table("language")
-            .select("name")
-            .in_("id", lang_ids)
-            .execute()
-        ).data or []
-        languages = _join_labels(lang_rows, "name")
+        rows = db.table("language").select("name").in_("id", lang_ids).execute().data or []
+        languages = _join_labels(rows, "name")
 
     return {
         "tourist_profile_id": tourist_profile_id,
-        "user_profile_id": tp["user_profile_id"],
-        "travel_style": tp.get("travel_style"),
-        "budget": tp.get("budget"),
-        "active_level": tp.get("active_level"),
-        "profile_bio": up.get("profile_bio"),
-        "interests": interests,
-        "languages": languages,
+        "user_profile_id":    tp["user_profile_id"],
+        "travel_style":       tp.get("travel_style"),
+        "budget":             tp.get("budget"),
+        "active_level":       tp.get("active_level"),
+        "profile_bio":        up.get("profile_bio"),
+        "interests":          interests,
+        "languages":          languages,
     }
 
 
 # ── Upsert helpers ────────────────────────────────────────────────────────────
 
 def upsert_guide_embedding(guide_profile_id: str) -> bool:
-    """Fetch → build text → embed → upsert to guide_profile.embedding"""
     row = fetch_guide_row(guide_profile_id)
     if not row:
         log.warning("guide_profile %s not found", guide_profile_id)
@@ -462,10 +399,15 @@ def upsert_activity_embedding(activity_id: str) -> bool:
 
 def upsert_tourist_embedding(tourist_profile_id: str) -> Dict[str, List[float]]:
     """
-    Compute the three tourist query vectors and store the guide-query
-    variant in tourist_profile.svector (primary cache).
-    Returns all three so rec_engine can use them immediately without
-    a second DB read.
+    Compute all three tourist query vectors and store them atomically.
+
+    Columns written:
+      t2g_embedding  — for querying guides
+      t2s_embedding  — for querying stays
+      t2a_embedding  — for querying activities
+
+    Returns {"guide": [...], "stay": [...], "activity": [...]}
+    so rec_engine can use them immediately without a second DB read.
     """
     row = fetch_tourist_row(tourist_profile_id)
     if not row:
@@ -475,15 +417,13 @@ def upsert_tourist_embedding(tourist_profile_id: str) -> Dict[str, List[float]]:
     vec_stay     = embed(tourist_text_for_stay(row))
     vec_activity = embed(tourist_text_for_activity(row))
 
-    # Store the guide-query vector as the canonical cached vector.
-    # Stay and activity variants are computed from it at query time
-    # (they share the same base text, only the bridge suffix differs).
-    # If you want to cache all three, add svector_stay / svector_activity columns.
-    get_supabase().table("tourist_profile").update(
-        {"tourist_svector": vec_guide}
-    ).eq("id", tourist_profile_id).execute()
+    get_supabase().table("tourist_profile").update({
+        "t2g_embedding": vec_guide,
+        "t2s_embedding": vec_stay,
+        "t2a_embedding": vec_activity,
+    }).eq("id", tourist_profile_id).execute()
 
-    log.info("Tourist %s embedded (3 variants)", tourist_profile_id)
+    log.info("Tourist %s embedded — t2g, t2s, t2a written", tourist_profile_id)
     return {
         "guide":    vec_guide,
         "stay":     vec_stay,
@@ -493,10 +433,29 @@ def upsert_tourist_embedding(tourist_profile_id: str) -> Dict[str, List[float]]:
 
 def invalidate_tourist_embedding(tourist_profile_id: str) -> None:
     """
-    Called when a tourist changes interests or languages.
-    Nulls out the cached vector so the next /recommend request recomputes it.
+    Null all three tourist vectors so next /recommend call recomputes them.
+    Called when interests, languages, travel_style, budget, or active_level change.
     """
-    get_supabase().table("tourist_profile").update(
-        {"tourist_svector": None}
-    ).eq("id", tourist_profile_id).execute()
-    log.info("Tourist %s tourist_svector invalidated", tourist_profile_id)
+    get_supabase().table("tourist_profile").update({
+        "t2g_embedding": None,
+        "t2s_embedding": None,
+        "t2a_embedding": None,
+    }).eq("id", tourist_profile_id).execute()
+    log.info("Tourist %s embeddings invalidated (t2g, t2s, t2a → NULL)", tourist_profile_id)
+
+
+def upsert_doc_chunk_embedding(chunk_id: str, content: str) -> bool:
+    """
+    Embed a single doc_chunk row and write back its vector.
+    Called by embed_docs.py script and the /embed/doc webhook.
+    """
+    try:
+        vec = embed(content)
+        get_supabase().table("doc_chunk").update(
+            {"embedding": vec}
+        ).eq("id", chunk_id).execute()
+        log.info("doc_chunk %s embedded", chunk_id)
+        return True
+    except Exception as e:
+        log.error("doc_chunk %s embedding failed: %s", chunk_id, e)
+        return False
