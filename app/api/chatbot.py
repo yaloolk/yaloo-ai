@@ -1,28 +1,35 @@
 """
 app/api/chatbot.py
 
-POST /chat
+POST /chat  — Single-call intent-routed RAG chatbot.
 
-Intent-routed RAG chatbot — three paths, minimal questions asked:
+KEY DESIGN: ONE Gemini call per user message (not two).
 
-  recommend → calls rec_engine with live data, injects results into prompt.
-              ONLY asks for city if missing. Never asks for anything else.
-  docs      → embeds user message, retrieves top-4 doc_chunk rows via pgvector.
-              Answers directly from those chunks.
-  general   → answers directly from Gemini training knowledge.
-              Zero context injection, lowest token cost.
+Previous design made two calls:
+  1. _classify_intent()   → one Gemini call to get JSON intent
+  2. chat_session.send_message() → one Gemini call for the actual reply
 
-Token budget per request (approximate):
-  Classifier call  :  ~100 tokens   (always)
-  general path     :  ~200 tokens   (no injection)
-  docs path        :  ~700 tokens   (200 system + 400 chunks + 100 reply)
-  recommend path   :  ~900 tokens   (200 system + 350 data + 350 reply)
-  recommend (no city): ~200 tokens  (just asks for city — no data fetch at all)
+This burned through the free tier quota (20 req/day) in 10 messages
+and also caused failures when the classifier returned malformed JSON.
 
-Multi-language: English, Sinhala, Tamil handled automatically by Gemini.
+New design — all in ONE call:
+  1. Before calling Gemini, we check the message ourselves for city info
+     using a simple keyword scan (zero API cost).
+  2. We build a system_instruction that tells Gemini exactly what to do
+     based on what context we have available (rec data / doc chunks / nothing).
+  3. Gemini reads the system instruction + user message and responds.
+     It implicitly understands the intent from the instructions — no JSON.
+
+Token budget per request:
+  general            : ~200–400 tokens  (system + message + reply)
+  docs               : ~700–900 tokens  (system + chunks + reply)
+  recommend (no city): ~200 tokens      (asks for city, no data fetch)
+  recommend (city)   : ~700–1000 tokens (system + live data + reply)
+
+Multi-language: Gemini handles English, Sinhala, Tamil natively.
 """
-import json
 import logging
+import re
 from typing import Optional
 
 import google.generativeai as genai
@@ -39,9 +46,6 @@ router = APIRouter()
 
 
 # ── Gemini model factory ──────────────────────────────────────────────────────
-# Returns a fresh GenerativeModel with system_instruction baked in.
-# Called once per /chat request — avoids re-configuring the API key on every
-# sub-call like _classify_intent was doing before.
 
 def _make_model(system_instruction: str) -> genai.GenerativeModel:
     s = get_settings()
@@ -54,60 +58,68 @@ def _make_model(system_instruction: str) -> genai.GenerativeModel:
     )
 
 
-# ── Intent classifier ─────────────────────────────────────────────────────────
-# Tiny dedicated call — max 30 output tokens, temperature 0 for determinism.
-# Separate from the main model so it doesn't pollute conversation history.
+# ── City extractor — zero API cost ────────────────────────────────────────────
+# Simple keyword scan over the message text.
+# Catches the most common cases without any API call.
+# If the user wrote the city name, we find it here.
 
-CLASSIFIER_PROMPT = """You are a query classifier for Yaloo, a Sri Lanka tourism platform.
-Classify the user message into exactly one category.
-Also extract the city name if the user mentions one, otherwise return null.
-
-Categories:
-- "recommend" → user wants to find guides, stays/homestays, or activities
-- "docs"       → user asks about Yaloo policies, booking process, fees, cancellation, safety, how Yaloo works
-- "general"    → general Sri Lanka travel questions, culture, weather, food, transport, tips
-
-Reply ONLY with a valid JSON object. No explanation. No markdown. No backticks.
-Format: {"type": "recommend"|"docs"|"general", "city": "city name or null"}
-
-User message: "{message}"
-"""
+_SRI_LANKA_CITIES = [
+    "colombo", "kandy", "galle", "ella", "sigiriya", "mirissa",
+    "negombo", "trincomalee", "jaffna", "nuwara eliya", "arugam bay",
+    "batticaloa", "ratnapura", "kurunegala", "matara", "badulla",
+]
 
 
-def _classify_intent(message: str) -> dict:
+def _extract_city(text: str) -> Optional[str]:
     """
-    One small Gemini call to classify intent and extract city.
-    Falls back to {"type": "general", "city": null} on any failure.
-    Uses a bare GenerativeModel (no system_instruction) to keep it lean.
+    Scan message text for a known Sri Lanka city name.
+    Returns the properly capitalised city name, or None if not found.
     """
-    try:
-        s = get_settings()
-        genai.configure(api_key=s.gemini_api_key)
-        classifier = genai.GenerativeModel("gemini-2.5-flash")
-        response = classifier.generate_content(
-            CLASSIFIER_PROMPT.format(message=message),
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=30,
-                temperature=0.0,
-            ),
-        )
-        raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw)
-        if result.get("type") not in ("recommend", "docs", "general"):
-            result["type"] = "general"
-        return result
-    except Exception as e:
-        log.warning("Intent classifier failed (%s) — defaulting to general", e)
-        return {"type": "general", "city": None}
+    lower = text.lower()
+    for city in _SRI_LANKA_CITIES:
+        if city in lower:
+            return city.title()
+    return None
+
+
+# ── Intent detector — zero API cost ──────────────────────────────────────────
+# Keyword-based classification. Fast, free, deterministic.
+# Handles English, and common Sinhala/Tamil romanisations reasonably well
+# since tourists typically mix English words when asking about services.
+
+_RECOMMEND_KEYWORDS = [
+    "guide", "stay", "homestay", "hotel", "accommodation", "activity",
+    "activities", "recommend", "find", "suggest", "book", "visit",
+    "tour", "place", "where", "what to do", "things to do",
+]
+
+_DOC_KEYWORDS = [
+    "policy", "cancel", "cancellation", "refund", "fee", "cost", "price",
+    "how does yaloo work", "how yaloo works", "booking", "payment", "safe",
+    "safety", "verify", "verified", "sltda", "contact", "support",
+    "register", "sign up", "sign-up", "account",
+]
+
+
+def _detect_intent(message: str) -> str:
+    """
+    Returns "recommend", "docs", or "general".
+    Checks recommend first, then docs, falls back to general.
+    """
+    lower = message.lower()
+    if any(kw in lower for kw in _RECOMMEND_KEYWORDS):
+        return "recommend"
+    if any(kw in lower for kw in _DOC_KEYWORDS):
+        return "docs"
+    return "general"
 
 
 # ── Context fetchers ──────────────────────────────────────────────────────────
 
 def _fetch_recommendation_context(tourist_id: str, city: str) -> str:
     """
-    Call rec_engine and format top-3 results per entity as a compact text block.
-    Only called when tourist_id AND city are both known — never speculatively.
-    Returns empty string on any failure so the bot still responds gracefully.
+    Calls rec_engine and formats top-3 results per entity type.
+    Returns empty string on failure — bot will degrade gracefully.
     """
     try:
         result = rec_engine.recommend(tourist_id=tourist_id, city=city, top_k=3)
@@ -143,16 +155,13 @@ def _fetch_recommendation_context(tourist_id: str, city: str) -> str:
                 f"{a.difficulty_level or 'N/A'} | LKR {a.base_price or '?'}"
             )
 
-    if not lines:
-        return ""
-
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else ""
 
 
 def _fetch_doc_context(message: str) -> str:
     """
-    Embed message → retrieve top-4 doc_chunk rows via pgvector KNN.
-    Returns empty string if no chunks found or on failure.
+    Embeds the user message and retrieves top-4 doc_chunk rows via pgvector.
+    Returns empty string if nothing found or on failure.
     """
     try:
         query_vec = embed(message)
@@ -163,16 +172,14 @@ def _fetch_doc_context(message: str) -> str:
         chunks = result.data or []
         if not chunks:
             return ""
-        return "\n\n".join(
-            f"[{c['doc_name']}]\n{c['content']}" for c in chunks
-        )
+        return "\n\n".join(f"[{c['doc_name']}]\n{c['content']}" for c in chunks)
     except Exception as e:
         log.warning("Doc search failed: %s", e)
         return ""
 
 
 def _tourist_context(tourist_id: str) -> str:
-    """Single-line tourist profile summary — injected into system prompt."""
+    """Compact tourist profile line injected into system prompt."""
     tp = (
         get_supabase()
         .table("tourist_profile")
@@ -184,66 +191,90 @@ def _tourist_context(tourist_id: str) -> str:
     if not tp:
         return ""
     return (
-        f"Tourist: style={tp.get('travel_style')}, "
-        f"budget={tp.get('budget')}, activity={tp.get('active_level')}."
+        f"Tourist profile: style={tp.get('travel_style')}, "
+        f"budget={tp.get('budget')}, activity_level={tp.get('active_level')}."
     )
 
 
 # ── System prompt builders ────────────────────────────────────────────────────
-# One builder per intent path. Each produces a tight system_instruction
-# with exactly the context that path needs — nothing more.
+# One builder per scenario. Each is tight — only the context that path needs.
 
-_YALOO_INTRO = "You are Yaloo Assistant (යාළු = Friend in Sinhala), helping tourists explore Sri Lanka."
-_BASE_RULES = "Reply in the user's language. Be concise. Ask at most one question per reply."
-
-
-def _system_recommend_no_city(tourist_ctx: str) -> str:
-    ctx_line = f"\n{tourist_ctx}" if tourist_ctx else ""
-    return f"""{_YALOO_INTRO}{ctx_line}
-Ask the user which city or area in Sri Lanka they plan to visit. One sentence only. No recommendations yet.
-{_BASE_RULES}"""
+_BASE = """Rules:
+- Reply in the SAME language the user wrote in (English / Sinhala / Tamil).
+- Be warm and concise. Do not repeat yourself.
+- Never ask more than ONE follow-up question per reply."""
 
 
-def _system_recommend_with_data(tourist_ctx: str, city: str, rec_data: str) -> str:
-    ctx_line = f"\n{tourist_ctx}" if tourist_ctx else ""
-    return f"""{_YALOO_INTRO}{ctx_line}
-Recommend options in {city} using ONLY the data below. Highlight the best 1–3 guide/stay fits for this tourist and briefly say why.
-For activities, list ALL of them and mention who offers each one.
-If guides or stays have no results, tell the user none are available right now and suggest they check back or try different dates/filters.
-Never invent prices, ratings, or names not in the data.
+def _prompt_recommend_no_city(tourist_ctx: str) -> str:
+    return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
+Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
 
-DATA:
+{tourist_ctx}
+
+The user wants a recommendation but has not mentioned which city they are visiting.
+Ask them which city or area in Sri Lanka they are heading to. One question only.
+Do not give recommendations yet.
+
+{_BASE}"""
+
+
+def _prompt_recommend_with_data(tourist_ctx: str, city: str, rec_data: str) -> str:
+    return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
+Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
+
+{tourist_ctx}
+
+The user wants recommendations in {city}. Use the live data below to answer.
+Highlight 1–2 best options and briefly explain why they match this tourist.
+Be selective and warm — do not dump the full list.
+
+LIVE DATA:
 {rec_data}
 
-{_BASE_RULES}"""
+{_BASE}
+- Do not invent prices, ratings, or names not in the live data."""
 
 
-def _system_recommend_no_tourist(city: str) -> str:
-    return f"""{_YALOO_INTRO}
+def _prompt_recommend_no_tourist(city: str) -> str:
+    return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
+Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
+
 The user wants recommendations in {city} but is not logged in.
-Briefly describe what Yaloo offers (local guides, homestays, activities) and encourage sign-up for personalised picks.
-{_BASE_RULES}"""
+Briefly describe what Yaloo offers (local guides, family homestays, activities).
+Encourage them to sign up or log in for personalised matches.
+
+{_BASE}"""
 
 
-def _system_docs(chunks: str) -> str:
+def _prompt_docs(chunks: str) -> str:
     if chunks:
-        return f"""{_YALOO_INTRO}
-Answer using ONLY the documentation below. If the answer isn't there, say so and suggest contacting Yaloo support.
+        return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
 
-DOCS:
+Answer the user's question using ONLY the documentation below. Be direct.
+If the answer is not in the docs, say so honestly and suggest they contact support.
+
+DOCUMENTATION:
 {chunks}
 
-{_BASE_RULES}"""
-    else:
-        return f"""{_YALOO_INTRO}
-No matching documentation found. Apologise briefly and suggest the user contact Yaloo support or check the app.
-{_BASE_RULES}"""
+{_BASE}"""
+    return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
+
+No matching documentation was found for this question.
+Apologise briefly and suggest the user contacts Yaloo support or checks the app.
+
+{_BASE}"""
 
 
-def _system_general() -> str:
-    return f"""{_YALOO_INTRO}
-Answer this general Sri Lanka travel question from your knowledge. Be helpful and concise.
-{_BASE_RULES}"""
+def _prompt_general(tourist_ctx: str) -> str:
+    return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
+Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
+
+{tourist_ctx}
+
+Answer this general Sri Lanka travel question from your own knowledge.
+Be helpful, warm, and concise. If you are unsure, say so.
+
+{_BASE}"""
 
 
 # ── Chat endpoint ─────────────────────────────────────────────────────────────
@@ -255,38 +286,43 @@ async def chat(req: ChatRequest):
 
     user_message = req.messages[-1].content
 
-    # ── Step 1: Classify intent (always, ~100 tokens) ─────────────────────────
-    intent     = _classify_intent(user_message)
-    intent_type = intent.get("type", "general")
-    city        = intent.get("city")  # may be None
-    log.info("Intent: %s | City: %s | tourist_id: %s", intent_type, city, req.tourist_id)
+    # ── Step 1: Classify intent — zero API cost ───────────────────────────────
+    intent_type = _detect_intent(user_message)
+    city        = _extract_city(user_message)
+    tourist_ctx = _tourist_context(req.tourist_id) if req.tourist_id else ""
 
-    # ── Step 2: Build system prompt for this specific request ─────────────────
+    log.info(
+        "Intent: %s | City: %s | tourist_id: %s",
+        intent_type, city, req.tourist_id,
+    )
+
+    # ── Step 2: Build system prompt + fetch context if needed ─────────────────
+    # Context is only fetched when we actually need it — never speculatively.
+
     if intent_type == "recommend":
-        tourist_ctx = _tourist_context(req.tourist_id) if req.tourist_id else ""
         if not city:
-            # City unknown → just ask. Zero data fetch. Cheapest possible path.
-            system_prompt = _system_recommend_no_city(tourist_ctx)
+            # No city in message → ask for it. Zero data fetch.
+            system_prompt = _prompt_recommend_no_city(tourist_ctx)
 
         elif req.tourist_id:
-            # City known + logged in → fetch live rec data and inject
+            # City + logged in → fetch live rec data
             rec_data = _fetch_recommendation_context(req.tourist_id, city)
             if rec_data:
-                system_prompt = _system_recommend_with_data(tourist_ctx, city, rec_data)
+                system_prompt = _prompt_recommend_with_data(tourist_ctx, city, rec_data)
             else:
-                # rec_engine returned nothing (no embeddings yet / all filtered out)
-                system_prompt = _system_recommend_no_tourist(city)
+                # rec_engine returned nothing (embeddings not ready / all filtered)
+                system_prompt = _prompt_recommend_no_tourist(city)
         else:
-            # City known but not logged in → generic Yaloo pitch
-            system_prompt = _system_recommend_no_tourist(city)
+            # City known, not logged in → generic pitch
+            system_prompt = _prompt_recommend_no_tourist(city)
 
     elif intent_type == "docs":
         chunks = _fetch_doc_context(user_message)
-        system_prompt = _system_docs(chunks)
+        system_prompt = _prompt_docs(chunks)
 
     else:
-        # general — no injection at all
-        system_prompt = _system_general()
+        # general — no data fetch at all
+        system_prompt = _prompt_general(tourist_ctx)
 
     # ── Step 3: Build conversation history (all turns except the last) ─────────
     history = []
@@ -296,13 +332,23 @@ async def chat(req: ChatRequest):
             "parts": [msg.content],
         })
 
-    # ── Step 4: Call Gemini with system_instruction baked in ──────────────────
+    # ── Step 4: ONE Gemini call ────────────────────────────────────────────────
     try:
         model        = _make_model(system_prompt)
         chat_session = model.start_chat(history=history)
         response     = chat_session.send_message(user_message)
         return ChatResponse(reply=response.text.strip(), sources=[])
 
-    except Exception:
+    except Exception as e:
+        err = str(e)
+        if "RESOURCE_EXHAUSTED" in err or "429" in err:
+            # Extract retry delay from the error message if present
+            match = re.search(r"retry in (\d+)", err, re.IGNORECASE)
+            retry_msg = f" Please try again in {match.group(1)} seconds." if match else ""
+            log.warning("Gemini quota exhausted.%s", retry_msg)
+            raise HTTPException(
+                status_code=429,
+                detail=f"The AI assistant has hit its daily request limit.{retry_msg}",
+            )
         log.exception("Gemini error")
         raise HTTPException(status_code=502, detail="Chat service temporarily unavailable")
