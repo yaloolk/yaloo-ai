@@ -106,40 +106,26 @@ class APIConfig:
                 logger.info("Reset to primary Gemini API")
 
     def handle_api_error(self, error: Exception) -> bool:
-        """
-        Record a failure on the current tier and advance if exhausted.
-        """
-        with self._lock:
-            # This block MUST be indented
-            cfg = self._current_cfg
-            cfg["retry_count"] += 1
+     with self._lock:
+        cfg = self._current_cfg
+        cfg["retry_count"] += 1
+        
+        # If the current key still has lives left, keep trying it
+        if cfg["retry_count"] < cfg["max_retries"]:
+            return True 
+
+        # Current key is DEAD. Move to the next one.
+        next_index = self._current_index + 1
+        if next_index < len(_TIER_NAMES):
+            self._current_index = next_index
             
-            logger.error(
-                "API error on %s (attempt %d/%d): %s",
-                cfg["name"], cfg["retry_count"], cfg["max_retries"], error,
-            )
-
-            if cfg["retry_count"] < cfg["max_retries"]:
-                return True  # Still have retries on this specific key
-
-            # Tier exhausted — try to advance to the next index
-            next_index = self._current_index + 1
+            # RESET the new key's counter so it gets its own 3 attempts
+            self._current_cfg["retry_count"] = 0 
             
-            if next_index < len(_TIER_NAMES):
-                self._current_index = next_index
-                # CRITICAL: Reset the NEW tier's counter to 0 
-                # so it doesn't start already "exhausted"
-                self._current_cfg["retry_count"] = 0 
-                
-                logger.warning(
-                    "Switching to %s after exhausting %s",
-                    self._current_cfg["name"], cfg["name"],
-                )
-                return True
+            logger.warning("Switched to %s", self._current_cfg["name"])
+            return True
 
-            # If we hit here, every single key in _TIER_NAMES is dead
-            logger.error("All Gemini API tiers exhausted.")
-            return False
+        return False # End of the line. All keys are exhausted.
 
 
 # Singleton used across the application.
@@ -158,11 +144,19 @@ def api_retry_with_fallback(max_attempts: int = 15):
                     try:
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
-                        return await func(*args, **kwargs) # Stay on current key on success
+                        
+                        # EXECUTE FUNCTION
+                        result = await func(*args, **kwargs)
+                        
+                        # REMOVED: api_config.reset_to_primary() 
+                        # Staying on the working key is the goal.
+                        return result
                     except Exception as error:
                         last_error = error
+                        # If handle_api_error returns False, it means we hit the 5th key's limit.
                         if not api_config.handle_api_error(error):
-                            api_config.reset_to_primary() # Only reset when totally empty
+                            # ONLY reset here if you want to loop back to start after total failure
+                            api_config.reset_to_primary() 
                             break
                         if attempt < max_attempts - 1:
                             await asyncio.sleep(min(2 ** attempt, 10))
