@@ -75,7 +75,7 @@ _SRI_LANKA_CITIES = [
 
 def _extract_city(text: str) -> Optional[str]:
     """
-    Scan message text for a known Sri Lanka city name.
+    Scan a text string for a known Sri Lanka city name.
     Returns the properly capitalised city name, or None if not found.
     """
     lower = text.lower()
@@ -83,6 +83,21 @@ def _extract_city(text: str) -> Optional[str]:
         if city in lower:
             return city.title()
     return None
+
+
+def _extract_city_from_history(messages) -> Optional[str]:
+    """
+    Walk the full conversation history (oldest → newest) looking for a city.
+    Returns the most recently mentioned city, or None.
+    This ensures the city provided in a previous turn (e.g. answering
+    "Which city are you visiting?") is not lost on subsequent messages.
+    """
+    found = None
+    for msg in messages:
+        city = _extract_city(msg.content)
+        if city:
+            found = city   # keep updating so we get the most recent mention
+    return found
 
 
 # ── Intent detector — zero API cost ──────────────────────────────────────────
@@ -97,28 +112,12 @@ _RECOMMEND_KEYWORDS = [
 ]
 
 # Keywords that signal a specific entity type within a recommend intent.
-# Checked in order: guide → stay → activity → None (means all).
+# Checked in priority order: guide → stay → activity → None (means all).
 _GUIDE_KEYWORDS    = ["guide", "guides", "local guide", "tour guide", "escort"]
 _STAY_KEYWORDS     = ["stay", "stays", "homestay", "homestays", "hotel", "accommodation",
                       "lodging", "place to sleep", "place to stay", "room", "host"]
 _ACTIVITY_KEYWORDS = ["activity", "activities", "things to do", "what to do", "experience",
-                      "experiences", "adventure", "hike", "hiking", "tour", "excursion"]
-
-
-def _detect_entity(message: str) -> Optional[str]:
-    """
-    Returns "guide", "stay", "activity", or None (meaning all three).
-    Checked in priority order: guide > stay > activity.
-    None means the user was vague ("recommend something in Kandy") → run all.
-    """
-    lower = message.lower()
-    if any(kw in lower for kw in _GUIDE_KEYWORDS):
-        return "guide"
-    if any(kw in lower for kw in _STAY_KEYWORDS):
-        return "stay"
-    if any(kw in lower for kw in _ACTIVITY_KEYWORDS):
-        return "activity"
-    return None
+                      "experiences", "adventure", "hike", "hiking", "excursion"]
 
 _DOC_KEYWORDS = [
     "policy", "cancel", "cancellation", "refund", "fee", "cost", "price",
@@ -139,6 +138,25 @@ def _detect_intent(message: str) -> str:
     if any(kw in lower for kw in _DOC_KEYWORDS):
         return "docs"
     return "general"
+
+
+def _detect_entity(messages) -> Optional[str]:
+    """
+    Scan the full conversation history for entity keywords.
+    Returns "guide", "stay", "activity", or None (meaning all three).
+    Scans oldest → newest so the most recent specific request wins.
+    None means the user was vague → run all three.
+    """
+    found = None
+    for msg in messages:
+        lower = msg.content.lower()
+        if any(kw in lower for kw in _GUIDE_KEYWORDS):
+            found = "guide"
+        elif any(kw in lower for kw in _STAY_KEYWORDS):
+            found = "stay"
+        elif any(kw in lower for kw in _ACTIVITY_KEYWORDS):
+            found = "activity"
+    return found
 
 
 # ── Context fetchers ──────────────────────────────────────────────────────────
@@ -164,12 +182,12 @@ def _fetch_linked_providers(activity_ids: list) -> str:
 
         guide_ids = list({r["guide_id"] for r in rows if r.get("guide_id")})
         stay_ids  = list({r["stay_id"]  for r in rows if r.get("stay_id")})
-        lines     = []
+        lines: list = []
 
         if guide_ids:
             g_rows = (
                 db.table("guide_profile")
-                .select("id, full_name, city_id, avg_rating, rate_per_hour")
+                .select("id, full_name, avg_rating, rate_per_hour")
                 .in_("id", guide_ids)
                 .execute()
             ).data or []
@@ -327,15 +345,16 @@ _BASE = """Rules:
 - Never ask more than ONE follow-up question per reply."""
 
 
-def _prompt_recommend_no_city(tourist_ctx: str) -> str:
+def _prompt_recommend_no_city(tourist_ctx: str, entity: str) -> str:
+    entity_label = entity or "options"
     return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
 Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
 
 {tourist_ctx}
 
-The user wants a recommendation but has not mentioned which city they are visiting.
-Ask them which city or area in Sri Lanka they are heading to. One question only.
-Do not give recommendations yet.
+The user wants {entity_label} recommendations but has not mentioned which city they are visiting.
+Ask ONLY: which city or area in Sri Lanka are they heading to?
+Do NOT ask anything else. Do NOT give recommendations yet.
 
 {_BASE}"""
 
@@ -408,10 +427,13 @@ async def chat(req: ChatRequest):
 
     user_message = req.messages[-1].content
 
-    # ── Step 1: Classify intent — zero API cost ───────────────────────────────
+    # ── Step 1: Classify intent + extract city/entity from full history ────────
+    # Intent is detected from the current message only (what does the user want NOW).
+    # City and entity are scanned across the ENTIRE history so that a city named
+    # in a previous turn (e.g. answering "Which city?") is not lost.
     intent_type = _detect_intent(user_message)
-    city        = _extract_city(user_message)
-    entity      = _detect_entity(user_message) if intent_type == "recommend" else None
+    city        = _extract_city_from_history(req.messages)   # scans all turns
+    entity      = _detect_entity(req.messages) if intent_type == "recommend" else None
     tourist_ctx = _tourist_context(req.tourist_id) if req.tourist_id else ""
 
     log.info(
@@ -424,11 +446,11 @@ async def chat(req: ChatRequest):
 
     if intent_type == "recommend":
         if not city:
-            # No city in message → ask for it. Zero data fetch.
-            system_prompt = _prompt_recommend_no_city(tourist_ctx)
+            # No city anywhere in conversation → ask for it once. Zero data fetch.
+            system_prompt = _prompt_recommend_no_city(tourist_ctx, entity or "travel")
 
         elif req.tourist_id:
-            # City + logged in → fetch live rec data (only the needed entity)
+            # City known + logged in → fetch only the needed entity's data
             rec_data = _fetch_recommendation_context(req.tourist_id, city, entity)
             if rec_data:
                 system_prompt = _prompt_recommend_with_data(tourist_ctx, city, rec_data)
