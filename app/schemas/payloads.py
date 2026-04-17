@@ -6,7 +6,7 @@ Pydantic models for:
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel,field_validator,Field
+from pydantic import BaseModel, field_validator, Field
 
 
 # ── Supabase DB webhook envelope ────────────────────────────────────────────
@@ -98,14 +98,18 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
+    # FIX: tourist_id is always required in the request body, but an empty string
+    # is now accepted and treated as "not logged in" (guest user).
+    # This avoids 422 errors when the Flutter client sends tourist_id: "" for
+    # unauthenticated users instead of omitting the field entirely.
     tourist_id: str
     messages: List[ChatMessage]
 
     @field_validator("tourist_id")
-    def must_not_be_empty(cls, v):
-        if not v or not v.strip():
-            raise ValueError("tourist_id is required")
-        return v
+    def tourist_id_must_be_string(cls, v: str) -> str:
+        # Allow empty string — chatbot.py checks `if req.tourist_id` before
+        # fetching tourist context, so empty string = guest mode gracefully.
+        return v.strip()
 
 
 class ChatResponse(BaseModel):
