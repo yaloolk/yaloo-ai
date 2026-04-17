@@ -4,6 +4,8 @@ Centralised settings loaded from environment variables.
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings
+from pydantic import SecretStr
+
 
 
 class Settings(BaseSettings):
@@ -18,7 +20,9 @@ class Settings(BaseSettings):
     embedding_dim: int = 768
 
     # --- Gemini (chatbot) ---
-    gemini_api_key: str = ""
+    PRIMARY_GEMINI_API_KEY:   SecretStr
+    SECONDARY_GEMINI_API_KEY: SecretStr
+    TERTIARY_GEMINI_API_KEY:  SecretStr
 
     # --- Recommendation engine ---
     top_k: int = 5

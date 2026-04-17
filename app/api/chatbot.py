@@ -40,6 +40,7 @@ from app.core.database import get_supabase
 from app.schemas.payloads import ChatRequest, ChatResponse
 from app.services import rec_engine
 from app.services.vector_service import embed
+from app.core.api_fallback import api_config
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -47,11 +48,13 @@ router = APIRouter()
 
 # ── Gemini model factory ──────────────────────────────────────────────────────
 
-def _make_model(system_instruction: str) -> genai.GenerativeModel:
-    s = get_settings()
-    if not s.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-    genai.configure(api_key=s.gemini_api_key)
+def _make_model(system_instruction: str, api_key: str) -> genai.GenerativeModel:
+    """
+    Build a GenerativeModel using the provided api_key.
+    Called inside the fallback retry loop — api_key changes per attempt
+    as the fallback chain advances through primary → secondary → tertiary.
+    """
+    genai.configure(api_key=api_key)
     return genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         system_instruction=system_instruction,
@@ -332,23 +335,48 @@ async def chat(req: ChatRequest):
             "parts": [msg.content],
         })
 
-    # ── Step 4: ONE Gemini call ────────────────────────────────────────────────
-    try:
-        model        = _make_model(system_prompt)
-        chat_session = model.start_chat(history=history)
-        response     = chat_session.send_message(user_message)
-        return ChatResponse(reply=response.text.strip(), sources=[])
+    # ── Step 4: Gemini call with fallback tier chain ──────────────────────────
+    # api_fallback walks primary → secondary → tertiary automatically.
+    # Each tier gets up to 3 attempts before advancing to the next key.
+    # On success, resets back to primary for the next request.
+    last_error: Exception | None = None
+    max_attempts = 9  # 3 tiers × 3 retries each
 
-    except Exception as e:
-        err = str(e)
-        if "RESOURCE_EXHAUSTED" in err or "429" in err:
-            # Extract retry delay from the error message if present
-            match = re.search(r"retry in (\d+)", err, re.IGNORECASE)
-            retry_msg = f" Please try again in {match.group(1)} seconds." if match else ""
-            log.warning("Gemini quota exhausted.%s", retry_msg)
-            raise HTTPException(
-                status_code=429,
-                detail=f"The AI assistant has hit its daily request limit.{retry_msg}",
+    for attempt in range(max_attempts):
+        try:
+            current_key  = api_config.get_current_api_key()
+            model        = _make_model(system_prompt, current_key)
+            chat_session = model.start_chat(history=history)
+            response     = chat_session.send_message(user_message)
+            api_config.reset_to_primary()   # success — reset for next request
+            return ChatResponse(reply=response.text.strip(), sources=[])
+
+        except Exception as e:
+            last_error = e
+            err = str(e)
+
+            log.warning(
+                "Gemini attempt %d/%d failed on %s: %s",
+                attempt + 1, max_attempts,
+                api_config.get_status()["api_name"], err[:120],
             )
-        log.exception("Gemini error")
-        raise HTTPException(status_code=502, detail="Chat service temporarily unavailable")
+
+            should_retry = api_config.handle_api_error(e)
+            if not should_retry:
+                break
+
+            # Brief pause before next attempt — exponential up to 10s
+            import asyncio
+            await asyncio.sleep(min(2 ** attempt, 10))
+
+    # All tiers and retries exhausted
+    err_str = str(last_error) if last_error else ""
+    if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
+        match = re.search(r"retry in (\d+)", err_str, re.IGNORECASE)
+        retry_msg = f" Please try again in {match.group(1)} seconds." if match else ""
+        raise HTTPException(
+            status_code=429,
+            detail=f"All API keys have reached their daily limit.{retry_msg}",
+        )
+    log.exception("All Gemini tiers exhausted. Last error: %s", last_error)
+    raise HTTPException(status_code=502, detail="Chat service temporarily unavailable")
