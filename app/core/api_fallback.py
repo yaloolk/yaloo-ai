@@ -108,27 +108,38 @@ class APIConfig:
     def handle_api_error(self, error: Exception) -> bool:
         """
         Record a failure on the current tier and advance if exhausted.
-
-        Returns:
-            True  — caller should retry (same tier has attempts left, or moved to next tier).
-            False — all tiers exhausted, caller should stop and raise.
         """
         with self._lock:
-        cfg = self._current_cfg
-        cfg["retry_count"] += 1
-        
-        if cfg["retry_count"] < cfg["max_retries"]:
-            return True 
+            # This block MUST be indented
+            cfg = self._current_cfg
+            cfg["retry_count"] += 1
+            
+            logger.error(
+                "API error on %s (attempt %d/%d): %s",
+                cfg["name"], cfg["retry_count"], cfg["max_retries"], error,
+            )
 
-        # Advance to next tier
-        next_index = self._current_index + 1
-        if next_index < len(_TIER_NAMES):
-            self._current_index = next_index
-            # Reset the new tier's counter so it gets its full max_retries
-            self._tiers[_TIER_NAMES[next_index]]["retry_count"] = 0 
-            return True
+            if cfg["retry_count"] < cfg["max_retries"]:
+                return True  # Still have retries on this specific key
 
-        return False # Signal exhaustion to the decorator
+            # Tier exhausted — try to advance to the next index
+            next_index = self._current_index + 1
+            
+            if next_index < len(_TIER_NAMES):
+                self._current_index = next_index
+                # CRITICAL: Reset the NEW tier's counter to 0 
+                # so it doesn't start already "exhausted"
+                self._current_cfg["retry_count"] = 0 
+                
+                logger.warning(
+                    "Switching to %s after exhausting %s",
+                    self._current_cfg["name"], cfg["name"],
+                )
+                return True
+
+            # If we hit here, every single key in _TIER_NAMES is dead
+            logger.error("All Gemini API tiers exhausted.")
+            return False
 
 
 # Singleton used across the application.
