@@ -5,32 +5,30 @@ POST /chat  — Single-call intent-routed RAG chatbot.
 
 KEY DESIGN: ONE Gemini call per user message (not two).
 
-Previous design made two calls:
-  1. _classify_intent()   → one Gemini call to get JSON intent
-  2. chat_session.send_message() → one Gemini call for the actual reply
+State is derived from the FULL conversation history on every request
+(city, intent, entity type). This is the correct approach because:
+  - The frontend sends the full message list on every POST /chat call.
+  - There is no server-side session; all state lives in the message list.
+  - Scanning history is zero API cost (pure Python keyword matching).
 
-This burned through the free tier quota (20 req/day) in 10 messages
-and also caused failures when the classifier returned malformed JSON.
-
-New design — all in ONE call:
-  1. Before calling Gemini, we check the message ourselves for city info
-     using a simple keyword scan (zero API cost).
-  2. We build a system_instruction that tells Gemini exactly what to do
-     based on what context we have available (rec data / doc chunks / nothing).
-  3. Gemini reads the system instruction + user message and responds.
-     It implicitly understands the intent from the instructions — no JSON.
+Intent / entity / city resolution rules:
+  intent  — detected from the CURRENT message first; if "general", fall back
+             to scanning user turns in history (oldest → newest) so that a
+             bare city reply like "Kandy" doesn't erase the earlier intent.
+  entity  — scanned across ALL user turns (oldest → newest); most recent wins.
+  city    — scanned across ALL turns (oldest → newest); most recent wins.
 
 Token budget per request:
-  general            : ~200–400 tokens  (system + message + reply)
-  docs               : ~700–900 tokens  (system + chunks + reply)
+  general            : ~200-400 tokens  (system + message + reply)
+  docs               : ~700-900 tokens  (system + chunks + reply)
   recommend (no city): ~200 tokens      (asks for city, no data fetch)
-  recommend (city)   : ~700–1000 tokens (system + live data + reply)
+  recommend (city)   : ~700-1000 tokens (system + live data + reply)
 
 Multi-language: Gemini handles English, Sinhala, Tamil natively.
 """
 import logging
 import re
-from typing import Optional
+from typing import List, Optional
 
 import google.generativeai as genai
 from fastapi import APIRouter, HTTPException
@@ -46,14 +44,9 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Gemini model factory ──────────────────────────────────────────────────────
+# -- Gemini model factory -----------------------------------------------------
 
 def _make_model(system_instruction: str, api_key: str) -> genai.GenerativeModel:
-    """
-    Build a GenerativeModel using the provided api_key.
-    Called inside the fallback retry loop — api_key changes per attempt
-    as the fallback chain advances through primary → secondary → tertiary.
-    """
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
         model_name="gemini-2.5-flash",
@@ -61,10 +54,7 @@ def _make_model(system_instruction: str, api_key: str) -> genai.GenerativeModel:
     )
 
 
-# ── City extractor — zero API cost ────────────────────────────────────────────
-# Simple keyword scan over the message text.
-# Catches the most common cases without any API call.
-# If the user wrote the city name, we find it here.
+# -- Known cities -------------------------------------------------------------
 
 _SRI_LANKA_CITIES = [
     "colombo", "kandy", "galle", "ella", "sigiriya", "mirissa",
@@ -73,51 +63,13 @@ _SRI_LANKA_CITIES = [
 ]
 
 
-def _extract_city(text: str) -> Optional[str]:
-    """
-    Scan a text string for a known Sri Lanka city name.
-    Returns the properly capitalised city name, or None if not found.
-    """
-    lower = text.lower()
-    for city in _SRI_LANKA_CITIES:
-        if city in lower:
-            return city.title()
-    return None
-
-
-def _extract_city_from_history(messages) -> Optional[str]:
-    """
-    Walk the full conversation history (oldest → newest) looking for a city.
-    Returns the most recently mentioned city, or None.
-    This ensures the city provided in a previous turn (e.g. answering
-    "Which city are you visiting?") is not lost on subsequent messages.
-    """
-    found = None
-    for msg in messages:
-        city = _extract_city(msg.content)
-        if city:
-            found = city   # keep updating so we get the most recent mention
-    return found
-
-
-# ── Intent detector — zero API cost ──────────────────────────────────────────
-# Keyword-based classification. Fast, free, deterministic.
-# Handles English, and common Sinhala/Tamil romanisations reasonably well
-# since tourists typically mix English words when asking about services.
+# -- Keyword lists ------------------------------------------------------------
 
 _RECOMMEND_KEYWORDS = [
     "guide", "stay", "homestay", "hotel", "accommodation", "activity",
     "activities", "recommend", "find", "suggest", "book", "visit",
     "tour", "place", "where", "what to do", "things to do",
 ]
-
-# Keywords that signal a specific entity type within a recommend intent.
-# Checked in priority order: guide → stay → activity → None (means all).
-_GUIDE_KEYWORDS    = ["guide", "guides", "local guide", "tour guide", "escort"]
-_STAY_KEYWORDS     = ["stay", "stays", "homestay", "homestays", "hotel", "accommodation",
-                      "lodging", "place to sleep", "place to stay", "room", "host"]
-_ACTIVITY_KEYWORDS = ["activity", "activities", "things to do", "what to do", "experience",
-                      "experiences", "adventure", "hike", "hiking", "excursion"]
 
 _DOC_KEYWORDS = [
     "policy", "cancel", "cancellation", "refund", "fee", "cost", "price",
@@ -126,13 +78,37 @@ _DOC_KEYWORDS = [
     "register", "sign up", "sign-up", "account",
 ]
 
+_GUIDE_KEYWORDS    = ["guide", "guides", "local guide", "tour guide"]
+_STAY_KEYWORDS     = ["stay", "stays", "homestay", "homestays", "hotel",
+                      "accommodation", "lodging", "place to stay", "room", "host"]
+_ACTIVITY_KEYWORDS = ["activity", "activities", "things to do", "what to do",
+                      "experience", "experiences", "adventure", "hike", "hiking",
+                      "excursion"]
 
-def _detect_intent(message: str) -> str:
-    """
-    Returns "recommend", "docs", or "general".
-    Checks recommend first, then docs, falls back to general.
-    """
-    lower = message.lower()
+
+# -- History-aware scanners (all zero API cost) --------------------------------
+
+def _extract_city(text: str) -> Optional[str]:
+    lower = text.lower()
+    for city in _SRI_LANKA_CITIES:
+        if city in lower:
+            return city.title()
+    return None
+
+
+def _scan_city(messages) -> Optional[str]:
+    """Scan ALL turns oldest->newest; return most recently mentioned city."""
+    found = None
+    for msg in messages:
+        c = _extract_city(msg.content)
+        if c:
+            found = c
+    return found
+
+
+def _detect_intent_text(text: str) -> str:
+    """Classify a single text string. Returns 'recommend', 'docs', or 'general'."""
+    lower = text.lower()
     if any(kw in lower for kw in _RECOMMEND_KEYWORDS):
         return "recommend"
     if any(kw in lower for kw in _DOC_KEYWORDS):
@@ -140,15 +116,44 @@ def _detect_intent(message: str) -> str:
     return "general"
 
 
-def _detect_entity(messages) -> Optional[str]:
+def _scan_intent(messages) -> str:
     """
-    Scan the full conversation history for entity keywords.
-    Returns "guide", "stay", "activity", or None (meaning all three).
-    Scans oldest → newest so the most recent specific request wins.
-    None means the user was vague → run all three.
+    Determine intent for the current turn.
+
+    Strategy:
+      1. Classify the current (last) user message.
+      2. If it is 'general', walk prior USER turns newest->oldest and inherit
+         the first non-general intent found.
+      This handles bare replies like "Kandy" or "ok" that have no intent
+      keywords but belong to an active recommendation conversation.
+    """
+    user_msgs = [m for m in messages if m.role == "user"]
+    if not user_msgs:
+        return "general"
+
+    current_intent = _detect_intent_text(user_msgs[-1].content)
+    if current_intent != "general":
+        return current_intent
+
+    # Fallback: walk history newest->oldest skipping the last message
+    for msg in reversed(user_msgs[:-1]):
+        intent = _detect_intent_text(msg.content)
+        if intent != "general":
+            return intent
+
+    return "general"
+
+
+def _scan_entity(messages) -> Optional[str]:
+    """
+    Scan ALL user turns oldest->newest for entity keywords.
+    Most recent specific mention wins.
+    Returns 'guide', 'stay', 'activity', or None (all three).
     """
     found = None
     for msg in messages:
+        if msg.role != "user":
+            continue
         lower = msg.content.lower()
         if any(kw in lower for kw in _GUIDE_KEYWORDS):
             found = "guide"
@@ -159,13 +164,12 @@ def _detect_entity(messages) -> Optional[str]:
     return found
 
 
-# ── Context fetchers ──────────────────────────────────────────────────────────
+# -- Context fetchers ---------------------------------------------------------
 
 def _fetch_linked_providers(activity_ids: list) -> str:
     """
-    For a list of activity IDs, query local_activity to find guides and stays
-    that offer them, and return a compact summary block.
-    Returns empty string if nothing found or on failure.
+    For a list of activity IDs, find guides and stays linked via local_activity.
+    Returns a compact summary block, or empty string on failure / nothing found.
     """
     if not activity_ids:
         return ""
@@ -173,7 +177,7 @@ def _fetch_linked_providers(activity_ids: list) -> str:
         db = get_supabase()
         rows = (
             db.table("local_activity")
-            .select("activity_id, guide_id, stay_id, name")
+            .select("activity_id, guide_id, stay_id")
             .in_("activity_id", activity_ids)
             .execute()
         ).data or []
@@ -182,7 +186,7 @@ def _fetch_linked_providers(activity_ids: list) -> str:
 
         guide_ids = list({r["guide_id"] for r in rows if r.get("guide_id")})
         stay_ids  = list({r["stay_id"]  for r in rows if r.get("stay_id")})
-        lines: list = []
+        lines: List[str] = []
 
         if guide_ids:
             g_rows = (
@@ -216,7 +220,6 @@ def _fetch_linked_providers(activity_ids: list) -> str:
                         f"LKR {st.get('price_per_night') or '?'}/night | "
                         f"Rating {st.get('avg_rating') or '?'}"
                     )
-
         return "\n".join(lines)
     except Exception as e:
         log.warning("_fetch_linked_providers failed: %s", e)
@@ -225,13 +228,11 @@ def _fetch_linked_providers(activity_ids: list) -> str:
 
 def _fetch_recommendation_context(tourist_id: str, city: str, entity: Optional[str]) -> str:
     """
-    Calls only the rec_engine function needed for the detected entity type.
-    For activities, also fetches guides/stays linked via local_activity.
-
-    entity: "guide" | "stay" | "activity" | None (all three)
-    Returns empty string on failure — bot degrades gracefully.
+    Call only the rec_engine function needed for the detected entity type.
+    entity: 'guide' | 'stay' | 'activity' | None (all three)
+    Returns empty string on failure.
     """
-    lines: list = []
+    lines: List[str] = []
 
     def _fmt_guides(guides) -> None:
         if not guides:
@@ -277,15 +278,13 @@ def _fetch_recommendation_context(tourist_id: str, city: str, entity: Optional[s
         elif entity == "activity":
             result = rec_engine.recommend_activities(tourist_id=tourist_id, city=city, top_k=3)
             _fmt_activities(result.activities)
-            # Enrich: find guides/stays linked to these activities via local_activity
             activity_ids = [a.activity_id for a in result.activities]
             linked = _fetch_linked_providers(activity_ids)
             if linked:
-                lines.append("")  # blank separator
+                lines.append("")
                 lines.append(linked)
 
         else:
-            # Vague request — run all three (original behaviour)
             result = rec_engine.recommend(tourist_id=tourist_id, city=city, top_k=3)
             _fmt_guides(result.guides)
             _fmt_stays(result.stays)
@@ -299,10 +298,6 @@ def _fetch_recommendation_context(tourist_id: str, city: str, entity: Optional[s
 
 
 def _fetch_doc_context(message: str) -> str:
-    """
-    Embeds the user message and retrieves top-4 doc_chunk rows via pgvector.
-    Returns empty string if nothing found or on failure.
-    """
     try:
         query_vec = embed(message)
         result = get_supabase().rpc(
@@ -319,7 +314,6 @@ def _fetch_doc_context(message: str) -> str:
 
 
 def _tourist_context(tourist_id: str) -> str:
-    """Compact tourist profile line injected into system prompt."""
     tp = (
         get_supabase()
         .table("tourist_profile")
@@ -336,25 +330,23 @@ def _tourist_context(tourist_id: str) -> str:
     )
 
 
-# ── System prompt builders ────────────────────────────────────────────────────
-# One builder per scenario. Each is tight — only the context that path needs.
+# -- System prompt builders ---------------------------------------------------
 
 _BASE = """Rules:
 - Reply in the SAME language the user wrote in (English / Sinhala / Tamil).
 - Be warm and concise. Do not repeat yourself.
-- Never ask more than ONE follow-up question per reply."""
+- Do NOT ask any follow-up questions unless you are explicitly waiting for the city name."""
 
 
 def _prompt_recommend_no_city(tourist_ctx: str, entity: str) -> str:
-    entity_label = entity or "options"
     return f"""You are Yaloo's AI travel assistant (යාළු means Friend in Sinhala).
 Yaloo connects tourists with local volunteer guides and family homestays in Sri Lanka.
 
 {tourist_ctx}
 
-The user wants {entity_label} recommendations but has not mentioned which city they are visiting.
-Ask ONLY: which city or area in Sri Lanka are they heading to?
-Do NOT ask anything else. Do NOT give recommendations yet.
+The user wants {entity} recommendations but has not mentioned which city they are visiting.
+Ask ONLY this: which city or area in Sri Lanka are they heading to?
+Do NOT ask anything else. Do NOT give recommendations yet. One question only.
 
 {_BASE}"""
 
@@ -365,9 +357,9 @@ Yaloo connects tourists with local volunteer guides and family homestays in Sri 
 
 {tourist_ctx}
 
-The user wants recommendations in {city}. Use the live data below to answer.
-Highlight 1–2 best options and briefly explain why they match this tourist.
-Be selective and warm — do not dump the full list.
+The user wants recommendations in {city}. Use ONLY the live data below to answer.
+Highlight 1-2 best options and briefly explain why they suit this tourist.
+Be warm and selective. Do not ask any follow-up questions.
 
 LIVE DATA:
 {rec_data}
@@ -382,7 +374,7 @@ Yaloo connects tourists with local volunteer guides and family homestays in Sri 
 
 The user wants recommendations in {city} but is not logged in.
 Briefly describe what Yaloo offers (local guides, family homestays, activities).
-Encourage them to sign up or log in for personalised matches.
+Encourage them to sign up or log in for personalised matches. Do not ask questions.
 
 {_BASE}"""
 
@@ -418,7 +410,7 @@ Be helpful, warm, and concise. If you are unsure, say so.
 {_BASE}"""
 
 
-# ── Chat endpoint ─────────────────────────────────────────────────────────────
+# -- Chat endpoint ------------------------------------------------------------
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
@@ -427,13 +419,21 @@ async def chat(req: ChatRequest):
 
     user_message = req.messages[-1].content
 
-    # ── Step 1: Classify intent + extract city/entity from full history ────────
-    # Intent is detected from the current message only (what does the user want NOW).
-    # City and entity are scanned across the ENTIRE history so that a city named
-    # in a previous turn (e.g. answering "Which city?") is not lost.
-    intent_type = _detect_intent(user_message)
-    city        = _extract_city_from_history(req.messages)   # scans all turns
-    entity      = _detect_entity(req.messages) if intent_type == "recommend" else None
+    # -- Step 1: Derive state from FULL history — zero API cost ---------------
+    #
+    # All three values are scanned across the entire message list so that
+    # context established in earlier turns is never lost.
+    #
+    # Example flow that previously broke:
+    #   Turn 1 (user):  "recommend a guide"     -> intent=recommend, entity=guide, city=None
+    #   Turn 2 (model): "Which city?"
+    #   Turn 3 (user):  "Colombo"               <- current message, no intent keywords
+    #     OLD: _detect_intent("Colombo") = "general"  -> wrong branch, lost everything
+    #     NEW: _scan_intent walks history, finds "recommend" from Turn 1 -> correct
+
+    intent_type = _scan_intent(req.messages)
+    city        = _scan_city(req.messages)
+    entity      = _scan_entity(req.messages) if intent_type == "recommend" else None
     tourist_ctx = _tourist_context(req.tourist_id) if req.tourist_id else ""
 
     log.info(
@@ -441,24 +441,22 @@ async def chat(req: ChatRequest):
         intent_type, entity, city, req.tourist_id,
     )
 
-    # ── Step 2: Build system prompt + fetch context if needed ─────────────────
-    # Context is only fetched when we actually need it — never speculatively.
+    # -- Step 2: Build system prompt + fetch context if needed ----------------
 
     if intent_type == "recommend":
         if not city:
-            # No city anywhere in conversation → ask for it once. Zero data fetch.
+            # No city anywhere in conversation -> ask for it once. Zero data fetch.
             system_prompt = _prompt_recommend_no_city(tourist_ctx, entity or "travel")
 
         elif req.tourist_id:
-            # City known + logged in → fetch only the needed entity's data
+            # City known + logged in -> fetch only the needed entity's data
             rec_data = _fetch_recommendation_context(req.tourist_id, city, entity)
             if rec_data:
                 system_prompt = _prompt_recommend_with_data(tourist_ctx, city, rec_data)
             else:
-                # rec_engine returned nothing (embeddings not ready / all filtered)
                 system_prompt = _prompt_recommend_no_tourist(city)
         else:
-            # City known, not logged in → generic pitch
+            # City known, not logged in -> generic pitch
             system_prompt = _prompt_recommend_no_tourist(city)
 
     elif intent_type == "docs":
@@ -466,10 +464,9 @@ async def chat(req: ChatRequest):
         system_prompt = _prompt_docs(chunks)
 
     else:
-        # general — no data fetch at all
         system_prompt = _prompt_general(tourist_ctx)
 
-    # ── Step 3: Build conversation history (all turns except the last) ─────────
+    # -- Step 3: Build conversation history (all turns except the last) -------
     history = []
     for msg in req.messages[:-1]:
         history.append({
@@ -477,12 +474,9 @@ async def chat(req: ChatRequest):
             "parts": [msg.content],
         })
 
-    # ── Step 4: Gemini call with fallback tier chain ──────────────────────────
-    # api_fallback walks primary → secondary → tertiary automatically.
-    # Each tier gets up to 3 attempts before advancing to the next key.
-    # On success, resets back to primary for the next request.
+    # -- Step 4: Gemini call with fallback tier chain -------------------------
     last_error: Exception | None = None
-    max_attempts = 9  # 3 tiers × 3 retries each
+    max_attempts = 9  # 3 tiers x 3 retries each
 
     for attempt in range(max_attempts):
         try:
@@ -490,7 +484,7 @@ async def chat(req: ChatRequest):
             model        = _make_model(system_prompt, current_key)
             chat_session = model.start_chat(history=history)
             response     = chat_session.send_message(user_message)
-            api_config.reset_to_primary()   # success — reset for next request
+            api_config.reset_to_primary()
             return ChatResponse(reply=response.text.strip(), sources=[])
 
         except Exception as e:
@@ -507,11 +501,9 @@ async def chat(req: ChatRequest):
             if not should_retry:
                 break
 
-            # Brief pause before next attempt — exponential up to 10s
             import asyncio
             await asyncio.sleep(min(2 ** attempt, 10))
 
-    # All tiers and retries exhausted
     err_str = str(last_error) if last_error else ""
     if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
         match = re.search(r"retry in (\d+)", err_str, re.IGNORECASE)
