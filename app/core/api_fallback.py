@@ -114,28 +114,21 @@ class APIConfig:
             False — all tiers exhausted, caller should stop and raise.
         """
         with self._lock:
-            cfg = self._current_cfg
-            cfg["retry_count"] += 1
-            logger.error(
-                "API error on %s (attempt %d/%d): %s",
-                cfg["name"], cfg["retry_count"], cfg["max_retries"], error,
-            )
+        cfg = self._current_cfg
+        cfg["retry_count"] += 1
+        
+        if cfg["retry_count"] < cfg["max_retries"]:
+            return True 
 
-            if cfg["retry_count"] < cfg["max_retries"]:
-                return True  # Still have retries on this tier.
+        # Advance to next tier
+        next_index = self._current_index + 1
+        if next_index < len(_TIER_NAMES):
+            self._current_index = next_index
+            # Reset the new tier's counter so it gets its full max_retries
+            self._tiers[_TIER_NAMES[next_index]]["retry_count"] = 0 
+            return True
 
-            # Tier exhausted — try to advance.
-            next_index = self._current_index + 1
-            if next_index < len(_TIER_NAMES):
-                self._current_index = next_index
-                logger.warning(
-                    "Switching to %s after exhausting %s",
-                    self._current_cfg["name"], cfg["name"],
-                )
-                return True
-
-            logger.error("All Gemini API tiers exhausted.")
-            return False
+        return False # Signal exhaustion to the decorator
 
 
 # Singleton used across the application.
@@ -154,22 +147,17 @@ def api_retry_with_fallback(max_attempts: int = 15):
                     try:
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
-                        
-                        result = await func(*args, **kwargs)
-                        # REMOVED: api_config.reset_to_primary() 
-                        # We stay on the working key until it fails.
-                        return result
+                        return await func(*args, **kwargs) # Stay on current key on success
                     except Exception as error:
                         last_error = error
                         if not api_config.handle_api_error(error):
-                            # All tiers exhausted. NOW we reset for the next cycle.
-                            api_config.reset_to_primary()
+                            api_config.reset_to_primary() # Only reset when totally empty
                             break
                         if attempt < max_attempts - 1:
                             await asyncio.sleep(min(2 ** attempt, 10))
                 raise last_error
             return async_wrapper
-
+        # ... apply same logic to sync_wrapper ...
         else:
             @wraps(func)
             def sync_wrapper(*args, **kwargs):
