@@ -545,7 +545,7 @@ def _tourist_context(tourist_id: str) -> str:
 # ── System prompt builders ────────────────────────────────────────────────────
 
 _BASE = """Rules:
-- Reply in the SAME language the user wrote in (English / Sinhala / Tamil).
+- Reply in the SAME language the user wrote.
 - Be warm and concise. Do not repeat yourself.
 - Do NOT ask any follow-up questions unless you are explicitly waiting for the city name."""
 
