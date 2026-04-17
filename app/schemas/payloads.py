@@ -6,7 +6,7 @@ Pydantic models for:
 """
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel,field_validator
 
 
 # ── Supabase DB webhook envelope ────────────────────────────────────────────
@@ -96,10 +96,15 @@ class ChatMessage(BaseModel):
     role: str    # "user" | "assistant"
     content: str
 
-
 class ChatRequest(BaseModel):
-    tourist_id: Optional[str] = None
+    tourist_id: str
     messages: List[ChatMessage]
+
+    @field_validator("tourist_id")
+    def must_not_be_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError("tourist_id is required")
+        return v
 
 
 class ChatResponse(BaseModel):
