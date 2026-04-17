@@ -56,7 +56,7 @@ def _make_model(system_instruction: str, api_key: str) -> genai.GenerativeModel:
     """
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        model_name="gemini-3.1-flash",
+        model_name="gemini-2.5-flash",
         system_instruction=system_instruction,
     )
 
