@@ -12,15 +12,16 @@ from pydantic import BaseModel,field_validator
 # ── Supabase DB webhook envelope ────────────────────────────────────────────
 
 class WebhookPayload(BaseModel):
-    """
-    Supabase fires this JSON body to your endpoint on row change.
-    Only `type` and `record` are needed by the embedding service.
-    """
-    type: str                        # "INSERT" | "UPDATE" | "DELETE"
+    type: str
     table: str
-    schema_: str = "public"
-    record: Dict[str, Any]           # the new row
+    # Use an alias to map incoming 'schema' to 'schema_'
+    schema_: str = Field(alias="schema")
+    record: Dict[str, Any]
     old_record: Optional[Dict[str, Any]] = None
+
+    class Config:
+        # This allows you to still use 'schema_' when creating the object manually
+        populate_by_name = True
 
 
 # ── Recommendation request ───────────────────────────────────────────────────
