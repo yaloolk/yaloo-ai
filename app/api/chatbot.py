@@ -96,6 +96,30 @@ _RECOMMEND_KEYWORDS = [
     "tour", "place", "where", "what to do", "things to do",
 ]
 
+# Keywords that signal a specific entity type within a recommend intent.
+# Checked in order: guide → stay → activity → None (means all).
+_GUIDE_KEYWORDS    = ["guide", "guides", "local guide", "tour guide", "escort"]
+_STAY_KEYWORDS     = ["stay", "stays", "homestay", "homestays", "hotel", "accommodation",
+                      "lodging", "place to sleep", "place to stay", "room", "host"]
+_ACTIVITY_KEYWORDS = ["activity", "activities", "things to do", "what to do", "experience",
+                      "experiences", "adventure", "hike", "hiking", "tour", "excursion"]
+
+
+def _detect_entity(message: str) -> Optional[str]:
+    """
+    Returns "guide", "stay", "activity", or None (meaning all three).
+    Checked in priority order: guide > stay > activity.
+    None means the user was vague ("recommend something in Kandy") → run all.
+    """
+    lower = message.lower()
+    if any(kw in lower for kw in _GUIDE_KEYWORDS):
+        return "guide"
+    if any(kw in lower for kw in _STAY_KEYWORDS):
+        return "stay"
+    if any(kw in lower for kw in _ACTIVITY_KEYWORDS):
+        return "activity"
+    return None
+
 _DOC_KEYWORDS = [
     "policy", "cancel", "cancellation", "refund", "fee", "cost", "price",
     "how does yaloo work", "how yaloo works", "booking", "payment", "safe",
@@ -119,44 +143,139 @@ def _detect_intent(message: str) -> str:
 
 # ── Context fetchers ──────────────────────────────────────────────────────────
 
-def _fetch_recommendation_context(tourist_id: str, city: str) -> str:
+def _fetch_linked_providers(activity_ids: list) -> str:
     """
-    Calls rec_engine and formats top-3 results per entity type.
-    Returns empty string on failure — bot will degrade gracefully.
+    For a list of activity IDs, query local_activity to find guides and stays
+    that offer them, and return a compact summary block.
+    Returns empty string if nothing found or on failure.
     """
+    if not activity_ids:
+        return ""
     try:
-        result = rec_engine.recommend(tourist_id=tourist_id, city=city, top_k=3)
+        db = get_supabase()
+        rows = (
+            db.table("local_activity")
+            .select("activity_id, guide_id, stay_id, name")
+            .in_("activity_id", activity_ids)
+            .execute()
+        ).data or []
+        if not rows:
+            return ""
+
+        guide_ids = list({r["guide_id"] for r in rows if r.get("guide_id")})
+        stay_ids  = list({r["stay_id"]  for r in rows if r.get("stay_id")})
+        lines     = []
+
+        if guide_ids:
+            g_rows = (
+                db.table("guide_profile")
+                .select("id, full_name, city_id, avg_rating, rate_per_hour")
+                .in_("id", guide_ids)
+                .execute()
+            ).data or []
+            if g_rows:
+                lines.append("Guides who offer these activities:")
+                for g in g_rows:
+                    lines.append(
+                        f"  {g.get('full_name', '?')} | "
+                        f"Rating {g.get('avg_rating') or '?'} | "
+                        f"LKR {g.get('rate_per_hour') or '?'}/hr"
+                    )
+
+        if stay_ids:
+            s_rows = (
+                db.table("stay")
+                .select("id, name, budget, price_per_night, avg_rating")
+                .in_("id", stay_ids)
+                .execute()
+            ).data or []
+            if s_rows:
+                lines.append("Stays that offer these activities:")
+                for st in s_rows:
+                    lines.append(
+                        f"  {st.get('name', '?')} | "
+                        f"{st.get('budget') or 'N/A'} | "
+                        f"LKR {st.get('price_per_night') or '?'}/night | "
+                        f"Rating {st.get('avg_rating') or '?'}"
+                    )
+
+        return "\n".join(lines)
     except Exception as e:
-        log.warning("rec_engine failed: %s", e)
+        log.warning("_fetch_linked_providers failed: %s", e)
         return ""
 
-    lines = []
 
-    if result.guides:
+def _fetch_recommendation_context(tourist_id: str, city: str, entity: Optional[str]) -> str:
+    """
+    Calls only the rec_engine function needed for the detected entity type.
+    For activities, also fetches guides/stays linked via local_activity.
+
+    entity: "guide" | "stay" | "activity" | None (all three)
+    Returns empty string on failure — bot degrades gracefully.
+    """
+    lines: list = []
+
+    def _fmt_guides(guides) -> None:
+        if not guides:
+            return
         lines.append("Guides:")
-        for g in result.guides:
+        for g in guides:
             lines.append(
                 f"  {g.full_name} | {g.city_name or 'N/A'} | "
                 f"Rating {g.avg_rating or '?'} | {g.experience_years or '?'} yrs | "
                 f"LKR {g.rate_per_hour or '?'}/hr | {g.languages or 'N/A'}"
             )
 
-    if result.stays:
+    def _fmt_stays(stays) -> None:
+        if not stays:
+            return
         lines.append("Stays:")
-        for st in result.stays:
+        for st in stays:
             lines.append(
                 f"  {st.name} | {st.city_name or 'N/A'} | {st.type or 'N/A'} | "
                 f"{st.budget or 'N/A'} | LKR {st.price_per_night or '?'}/night | "
                 f"Rating {st.avg_rating or '?'}"
             )
 
-    if result.activities:
+    def _fmt_activities(activities) -> None:
+        if not activities:
+            return
         lines.append("Activities:")
-        for a in result.activities:
+        for a in activities:
             lines.append(
                 f"  {a.name} | {a.category or 'N/A'} | "
                 f"{a.difficulty_level or 'N/A'} | LKR {a.base_price or '?'}"
             )
+
+    try:
+        if entity == "guide":
+            result = rec_engine.recommend_guides(tourist_id=tourist_id, city=city, top_k=3)
+            _fmt_guides(result.guides)
+
+        elif entity == "stay":
+            result = rec_engine.recommend_stays(tourist_id=tourist_id, city=city, top_k=3)
+            _fmt_stays(result.stays)
+
+        elif entity == "activity":
+            result = rec_engine.recommend_activities(tourist_id=tourist_id, city=city, top_k=3)
+            _fmt_activities(result.activities)
+            # Enrich: find guides/stays linked to these activities via local_activity
+            activity_ids = [a.activity_id for a in result.activities]
+            linked = _fetch_linked_providers(activity_ids)
+            if linked:
+                lines.append("")  # blank separator
+                lines.append(linked)
+
+        else:
+            # Vague request — run all three (original behaviour)
+            result = rec_engine.recommend(tourist_id=tourist_id, city=city, top_k=3)
+            _fmt_guides(result.guides)
+            _fmt_stays(result.stays)
+            _fmt_activities(result.activities)
+
+    except Exception as e:
+        log.warning("rec_engine failed (entity=%s): %s", entity, e)
+        return ""
 
     return "\n".join(lines) if lines else ""
 
@@ -292,11 +411,12 @@ async def chat(req: ChatRequest):
     # ── Step 1: Classify intent — zero API cost ───────────────────────────────
     intent_type = _detect_intent(user_message)
     city        = _extract_city(user_message)
+    entity      = _detect_entity(user_message) if intent_type == "recommend" else None
     tourist_ctx = _tourist_context(req.tourist_id) if req.tourist_id else ""
 
     log.info(
-        "Intent: %s | City: %s | tourist_id: %s",
-        intent_type, city, req.tourist_id,
+        "Intent: %s | Entity: %s | City: %s | tourist_id: %s",
+        intent_type, entity, city, req.tourist_id,
     )
 
     # ── Step 2: Build system prompt + fetch context if needed ─────────────────
@@ -308,8 +428,8 @@ async def chat(req: ChatRequest):
             system_prompt = _prompt_recommend_no_city(tourist_ctx)
 
         elif req.tourist_id:
-            # City + logged in → fetch live rec data
-            rec_data = _fetch_recommendation_context(req.tourist_id, city)
+            # City + logged in → fetch live rec data (only the needed entity)
+            rec_data = _fetch_recommendation_context(req.tourist_id, city, entity)
             if rec_data:
                 system_prompt = _prompt_recommend_with_data(tourist_ctx, city, rec_data)
             else:
