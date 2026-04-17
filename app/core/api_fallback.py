@@ -145,17 +145,7 @@ api_config = APIConfig()
 # ── Retry decorator ───────────────────────────────────────────────────────────
 
 def api_retry_with_fallback(max_attempts: int = 15):
-    """
-    Decorator that retries a function across the fallback tier chain.
-
-    Works on both sync and async functions.
-    Automatically injects the current api_key kwarg when the caller passes it.
-
-    max_attempts defaults to 15 (5 tiers x 3 retries each).
-    Raise this value if you add more tiers or increase max_retries.
-    """
     def decorator(func: Callable) -> Callable:
-
         if inspect.iscoroutinefunction(func):
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
@@ -164,17 +154,19 @@ def api_retry_with_fallback(max_attempts: int = 15):
                     try:
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
+                        
                         result = await func(*args, **kwargs)
-                        api_config.reset_to_primary()
+                        # REMOVED: api_config.reset_to_primary() 
+                        # We stay on the working key until it fails.
                         return result
                     except Exception as error:
                         last_error = error
-                        logger.error("Async attempt %d/%d failed: %s", attempt + 1, max_attempts, error)
                         if not api_config.handle_api_error(error):
+                            # All tiers exhausted. NOW we reset for the next cycle.
+                            api_config.reset_to_primary()
                             break
                         if attempt < max_attempts - 1:
                             await asyncio.sleep(min(2 ** attempt, 10))
-                logger.error("All async attempts failed. Last error: %s", last_error)
                 raise last_error
             return async_wrapper
 
@@ -186,20 +178,19 @@ def api_retry_with_fallback(max_attempts: int = 15):
                     try:
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
+                        
                         result = func(*args, **kwargs)
-                        api_config.reset_to_primary()
+                        # REMOVED: api_config.reset_to_primary()
                         return result
                     except Exception as error:
                         last_error = error
-                        logger.error("Sync attempt %d/%d failed: %s", attempt + 1, max_attempts, error)
                         if not api_config.handle_api_error(error):
+                            api_config.reset_to_primary()
                             break
                         if attempt < max_attempts - 1:
                             time.sleep(min(2 ** attempt, 10))
-                logger.error("All sync attempts failed. Last error: %s", last_error)
                 raise last_error
             return sync_wrapper
-
     return decorator
 
 
