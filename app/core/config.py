@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     PRIMARY_GEMINI_API_KEY:   SecretStr
     SECONDARY_GEMINI_API_KEY: SecretStr
     TERTIARY_GEMINI_API_KEY:  SecretStr
+    FOURTH_GEMINI_API_KEY:    SecretStr
+    FIFTH_GEMINI_API_KEY:     SecretStr
 
     # --- Recommendation engine ---
     top_k: int = 5
