@@ -1,14 +1,3 @@
-"""
-API Fallback Management for Gemini API Keys.
-
-Supports a 3-tier fallback chain: primary → secondary → tertiary.
-Thread-safe for concurrent request handling.
-
-To add a 4th key in future:
-  1. Add QUATERNARY_GEMINI_API_KEY to settings.
-  2. Add a "quaternary" entry in APIConfig.__init__() following the same pattern.
-  3. No other changes needed — the retry logic is tier-count agnostic.
-"""
 import asyncio
 import inspect
 import logging
@@ -19,19 +8,17 @@ from functools import wraps
 
 from app.core.config import settings
 
-
 logger = logging.getLogger(__name__)
 
 # Ordered fallback chain — index 0 is tried first.
-_TIER_NAMES = ("primary", "secondary", "tertiary","fourth","fifth")
-
+_TIER_NAMES = ("primary", "secondary", "tertiary", "fourth", "fifth")
 
 class APIConfig:
     """Text API configuration with N-tier fallback support. Thread-safe."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._current_index: int = 0  # index into _TIER_NAMES
+        self._current_index: int = 0  
 
         self._tiers: Dict[str, Dict[str, Any]] = {
             "primary": {
@@ -54,19 +41,17 @@ class APIConfig:
             },
             "fourth": {
                 "api_key":     settings.FOURTH_GEMINI_API_KEY.get_secret_value(),
-                "name":        "fourth Gemini API",
+                "name":        "Fourth Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
             },
             "fifth": {
                 "api_key":     settings.FIFTH_GEMINI_API_KEY.get_secret_value(),
-                "name":        "fifth Gemini API",
+                "name":        "Fifth Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
             },
         }
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
 
     @property
     def _current_tier(self) -> str:
@@ -76,15 +61,11 @@ class APIConfig:
     def _current_cfg(self) -> Dict[str, Any]:
         return self._tiers[self._current_tier]
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def get_current_api_key(self) -> str:
-        """Return the active API key."""
         with self._lock:
             return self._current_cfg["api_key"]
 
     def get_status(self) -> Dict[str, Any]:
-        """Return a safe status snapshot (key masked)."""
         with self._lock:
             key = self._current_cfg["api_key"]
             return {
@@ -97,7 +78,6 @@ class APIConfig:
             }
 
     def reset_to_primary(self) -> None:
-        """Reset the active tier to primary and clear all retry counters."""
         with self._lock:
             if self._current_index != 0:
                 self._current_index = 0
@@ -106,33 +86,23 @@ class APIConfig:
                 logger.info("Reset to primary Gemini API")
 
     def handle_api_error(self, error: Exception) -> bool:
-     with self._lock:
-        cfg = self._current_cfg
-        cfg["retry_count"] += 1
-        
-        # If the current key still has lives left, keep trying it
-        if cfg["retry_count"] < cfg["max_retries"]:
-            return True 
-
-        # Current key is DEAD. Move to the next one.
-        next_index = self._current_index + 1
-        if next_index < len(_TIER_NAMES):
-            self._current_index = next_index
+        with self._lock:
+            cfg = self._current_cfg
+            cfg["retry_count"] += 1
             
-            # RESET the new key's counter so it gets its own 3 attempts
-            self._current_cfg["retry_count"] = 0 
-            
-            logger.warning("Switched to %s", self._current_cfg["name"])
-            return True
+            if cfg["retry_count"] < cfg["max_retries"]:
+                return True 
 
-        return False # End of the line. All keys are exhausted.
+            next_index = self._current_index + 1
+            if next_index < len(_TIER_NAMES):
+                self._current_index = next_index
+                self._current_cfg["retry_count"] = 0 
+                logger.warning("Switched to %s", self._current_cfg["name"])
+                return True
 
+            return False
 
-# Singleton used across the application.
 api_config = APIConfig()
-
-
-# ── Retry decorator ───────────────────────────────────────────────────────────
 
 def api_retry_with_fallback(max_attempts: int = 15):
     def decorator(func: Callable) -> Callable:
@@ -145,24 +115,16 @@ def api_retry_with_fallback(max_attempts: int = 15):
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
                         
-                        # EXECUTE FUNCTION
-                        result = await func(*args, **kwargs)
-                        
-                        # REMOVED: api_config.reset_to_primary() 
-                        # Staying on the working key is the goal.
-                        return result
+                        return await func(*args, **kwargs)
                     except Exception as error:
                         last_error = error
-                        # If handle_api_error returns False, it means we hit the 5th key's limit.
                         if not api_config.handle_api_error(error):
-                            # ONLY reset here if you want to loop back to start after total failure
                             api_config.reset_to_primary() 
                             break
                         if attempt < max_attempts - 1:
                             await asyncio.sleep(min(2 ** attempt, 10))
                 raise last_error
             return async_wrapper
-        # ... apply same logic to sync_wrapper ...
         else:
             @wraps(func)
             def sync_wrapper(*args, **kwargs):
@@ -171,10 +133,7 @@ def api_retry_with_fallback(max_attempts: int = 15):
                     try:
                         if "api_key" in kwargs:
                             kwargs["api_key"] = api_config.get_current_api_key()
-                        
-                        result = func(*args, **kwargs)
-                        # REMOVED: api_config.reset_to_primary()
-                        return result
+                        return func(*args, **kwargs)
                     except Exception as error:
                         last_error = error
                         if not api_config.handle_api_error(error):
@@ -186,25 +145,14 @@ def api_retry_with_fallback(max_attempts: int = 15):
             return sync_wrapper
     return decorator
 
-
-# ── Convenience helpers (drop-in replacements for old module-level functions) ─
-
+# Convenience helpers
 def get_current_api_key() -> str:
     return api_config.get_current_api_key()
-
 
 def reset_to_primary_api() -> None:
     api_config.reset_to_primary()
 
-
 def get_api_status() -> Dict[str, Any]:
     return api_config.get_status()
 
-
-__all__ = [
-    "api_config",
-    "api_retry_with_fallback",
-    "get_current_api_key",
-    "reset_to_primary_api",
-    "get_api_status",
-]
+__all__ = ["api_config", "api_retry_with_fallback", "get_current_api_key", "reset_to_primary_api", "get_api_status"]
