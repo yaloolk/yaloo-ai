@@ -59,8 +59,7 @@ _SRI_LANKA_CITIES = [
 
 _RECOMMEND_KEYWORDS = [
     "guide", "stay", "homestay", "hotel", "accommodation", "activity",
-    "activities", "recommend", "find", "suggest", "book", "visit",
-    "tour", "place", "where", "what to do", "things to do",
+    "activities", "recommend", "what to do", "things to do",
 ]
 
 _DOC_KEYWORDS = [
@@ -679,7 +678,7 @@ async def chat(req: ChatRequest):
 
     # ── Step 4: Gemini call with fallback tier chain ──────────────────────────
     last_error: Exception | None = None
-    max_attempts = 9  # 3 tiers × 3 retries each
+    max_attempts = 15  # 5 tiers × 3 retries each
 
     for attempt in range(max_attempts):
         try:
@@ -687,7 +686,6 @@ async def chat(req: ChatRequest):
             model        = _make_model(system_prompt, current_key)
             chat_session = model.start_chat(history=history)
             response     = chat_session.send_message(user_message)
-            api_config.reset_to_primary()
             return ChatResponse(reply=response.text.strip(), sources=[])
 
         except Exception as e:
