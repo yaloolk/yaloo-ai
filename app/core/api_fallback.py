@@ -23,7 +23,7 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 # Ordered fallback chain — index 0 is tried first.
-_TIER_NAMES = ("primary", "secondary", "tertiary")
+_TIER_NAMES = ("primary", "secondary", "tertiary","fourth","fifth")
 
 
 class APIConfig:
@@ -49,6 +49,18 @@ class APIConfig:
             "tertiary": {
                 "api_key":     settings.TERTIARY_GEMINI_API_KEY.get_secret_value(),
                 "name":        "Tertiary Gemini API",
+                "retry_count": 0,
+                "max_retries": 3,
+            },
+            "fourth": {
+                "api_key":     settings.FOURTH_GEMINI_API_KEY.get_secret_value(),
+                "name":        "fourth Gemini API",
+                "retry_count": 0,
+                "max_retries": 3,
+            },
+            "fifth": {
+                "api_key":     settings.FIFTH_GEMINI_API_KEY.get_secret_value(),
+                "name":        "fifth Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
             },
@@ -132,14 +144,14 @@ api_config = APIConfig()
 
 # ── Retry decorator ───────────────────────────────────────────────────────────
 
-def api_retry_with_fallback(max_attempts: int = 9):
+def api_retry_with_fallback(max_attempts: int = 15):
     """
     Decorator that retries a function across the fallback tier chain.
 
     Works on both sync and async functions.
     Automatically injects the current api_key kwarg when the caller passes it.
 
-    max_attempts defaults to 9 (3 tiers x 3 retries each).
+    max_attempts defaults to 15 (5 tiers x 3 retries each).
     Raise this value if you add more tiers or increase max_retries.
     """
     def decorator(func: Callable) -> Callable:
