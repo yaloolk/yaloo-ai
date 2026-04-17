@@ -35,19 +35,19 @@ class APIConfig:
 
         self._tiers: Dict[str, Dict[str, Any]] = {
             "primary": {
-                "api_key":     settings.PRIMARY_GEMINI_API_KEY.get_secret_value(),
+                "api_key":     Settings.PRIMARY_GEMINI_API_KEY.get_secret_value(),
                 "name":        "Primary Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
             },
             "secondary": {
-                "api_key":     settings.SECONDARY_GEMINI_API_KEY.get_secret_value(),
+                "api_key":     Settings.SECONDARY_GEMINI_API_KEY.get_secret_value(),
                 "name":        "Secondary Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
             },
             "tertiary": {
-                "api_key":     settings.TERTIARY_GEMINI_API_KEY.get_secret_value(),
+                "api_key":     Settings.TERTIARY_GEMINI_API_KEY.get_secret_value(),
                 "name":        "Tertiary Gemini API",
                 "retry_count": 0,
                 "max_retries": 3,
