@@ -528,12 +528,79 @@ async def embed_doc(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RECOMMENDATION ENDPOINT
+# RECOMMENDATION ENDPOINTS  (split by type for faster, targeted calls)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@router.post("/recommend/guides", response_model=RecommendResponse)
+async def recommend_guides(req: RecommendRequest):
+    """
+    Return only guide recommendations for the tourist.
+    Use this when you only need guides — avoids computing stays & activities.
+    """
+    try:
+        result = rec_engine.recommend_guides(
+            tourist_id=req.tourist_id,
+            city=req.city,
+            guide_gender=req.guide_gender,
+            top_k=req.top_k,
+            available_guide_ids=req.available_guide_ids,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        log.exception("Guide recommendation failed for tourist %s", req.tourist_id)
+        raise HTTPException(status_code=500, detail="Recommendation engine error")
+
+
+@router.post("/recommend/stays", response_model=RecommendResponse)
+async def recommend_stays(req: RecommendRequest):
+    """
+    Return only stay recommendations for the tourist.
+    Use this when you only need stays — avoids computing guides & activities.
+    """
+    try:
+        result = rec_engine.recommend_stays(
+            tourist_id=req.tourist_id,
+            city=req.city,
+            top_k=req.top_k,
+            available_stay_ids=req.available_stay_ids,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        log.exception("Stay recommendation failed for tourist %s", req.tourist_id)
+        raise HTTPException(status_code=500, detail="Recommendation engine error")
+
+
+@router.post("/recommend/activities", response_model=RecommendResponse)
+async def recommend_activities(req: RecommendRequest):
+    """
+    Return only activity recommendations for the tourist.
+    Use this when you only need activities — avoids computing guides & stays.
+    """
+    try:
+        result = rec_engine.recommend_activities(
+            tourist_id=req.tourist_id,
+            city=req.city,
+            top_k=req.top_k,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        log.exception("Activity recommendation failed for tourist %s", req.tourist_id)
+        raise HTTPException(status_code=500, detail="Recommendation engine error")
+
 
 @router.post("/recommend", response_model=RecommendResponse)
 async def get_recommendations(req: RecommendRequest):
-    """Called by the Yaloo mobile app."""
+    """
+    Return all recommendations (guides + stays + activities) in one call.
+    Kept for backward compatibility — prefer the split endpoints above
+    when you only need one type.
+    """
     try:
         result = rec_engine.recommend(
             tourist_id=req.tourist_id,

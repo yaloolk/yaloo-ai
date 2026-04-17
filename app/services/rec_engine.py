@@ -157,79 +157,59 @@ def _get_guide_labels(user_profile_id: str) -> Dict[str, str]:
     return {"interests": interests, "languages": languages}
 
 
-# ── Tourist vector resolution ─────────────────────────────────────────────────
 
-def _get_tourist_vectors(tourist_id: str) -> Dict[str, List[float]]:
-    """
-    Read all three cached vectors from tourist_profile.
-    If ANY is NULL → recompute and store all three atomically.
-    Returns {"guide": [...], "stay": [...], "activity": [...]}
-    """
-    db = get_supabase()
-    row = (
-        db.table("tourist_profile")
-        .select("id, t2g_embedding, t2s_embedding, t2a_embedding")
-        .eq("id", tourist_id)
-        .single()
-        .execute()
-    ).data
+# ── Tourist profile helper ────────────────────────────────────────────────────
 
-    if not row:
-        raise ValueError(f"tourist_profile not found: {tourist_id}")
-
-    t2g = row.get("t2g_embedding")
-    t2s = row.get("t2s_embedding")
-    t2a = row.get("t2a_embedding")
-
-    # If all three are cached, return them directly — zero embed calls
-    if t2g and t2s and t2a:
-        return {"guide": t2g, "stay": t2s, "activity": t2a}
-
-    # Any column is NULL → recompute all three and store atomically
-    log.info("Tourist %s: missing vectors, recomputing all three", tourist_id)
-    return upsert_tourist_embedding(tourist_id)
-
-
-# ── Public recommendation function ───────────────────────────────────────────
-
-def recommend(
-    tourist_id: str,
-    city: Optional[str] = None,
-    guide_gender: Optional[str] = None,
-    top_k: int = 5,
-    available_guide_ids: Optional[List[str]] = None,
-    available_stay_ids: Optional[List[str]] = None,
-) -> RecommendResponse:
-    """
-    Main entry point — called by POST /recommend.
-    Reads t2g/t2s/t2a vectors from tourist_profile (or recomputes if NULL).
-    """
-    db = get_supabase()
-
+def _get_tourist_profile(tourist_id: str) -> Dict[str, str]:
+    """Fetch budget and active_level from tourist_profile."""
     tp = (
-        db.table("tourist_profile")
+        get_supabase()
+        .table("tourist_profile")
         .select("budget, active_level")
         .eq("id", tourist_id)
         .single()
         .execute()
     ).data or {}
-    tourist_budget = tp.get("budget", "")
-    tourist_active = tp.get("active_level", "")
+    return tp
 
-    vecs = _get_tourist_vectors(tourist_id)
 
-    # ── GUIDES ───────────────────────────────────────────────────────────────
-    raw_guides = _knn_guides(
-        vecs["guide"], city, guide_gender,
-        n=top_k, available_ids=available_guide_ids,
-    )
+# ── Public focused recommendation functions ───────────────────────────────────
+
+def recommend_guides(
+    tourist_id: str,
+    city: Optional[str] = None,
+    guide_gender: Optional[str] = None,
+    top_k: int = 5,
+    available_guide_ids: Optional[List[str]] = None,
+) -> RecommendResponse:
+    """
+    Guide-only recommendations — called by POST /recommend/guides.
+    Only fetches t2g_embedding; skips stay and activity computation entirely.
+    """
+    row = (
+        get_supabase()
+        .table("tourist_profile")
+        .select("id, t2g_embedding")
+        .eq("id", tourist_id)
+        .single()
+        .execute()
+    ).data
+    if not row:
+        raise ValueError(f"tourist_profile not found: {tourist_id}")
+
+    t2g = row.get("t2g_embedding")
+    if not t2g:
+        log.info("Tourist %s: missing t2g vector, recomputing all three", tourist_id)
+        t2g = upsert_tourist_embedding(tourist_id)["guide"]
+
+    raw_guides = _knn_guides(t2g, city, guide_gender, n=top_k, available_ids=available_guide_ids)
     guide_results: List[GuideResult] = []
-    seen_guides: set = set()
+    seen: set = set()
     for g in raw_guides:
         gid = str(g.get("guide_profile_id", ""))
-        if gid in seen_guides:
+        if gid in seen:
             continue
-        seen_guides.add(gid)
+        seen.add(gid)
         vec_sim = float(g.get("vec_sim", 0))
         labels = _get_guide_labels(str(g.get("user_profile_id", "")))
         guide_results.append(GuideResult(
@@ -250,23 +230,47 @@ def recommend(
         if len(guide_results) >= top_k:
             break
 
-    # ── STAYS ────────────────────────────────────────────────────────────────
-    raw_stays = _knn_stays(
-        vecs["stay"], city,
-        n=top_k, available_ids=available_stay_ids,
-    )
+    return RecommendResponse(tourist_id=tourist_id, guides=guide_results, stays=[], activities=[])
+
+
+def recommend_stays(
+    tourist_id: str,
+    city: Optional[str] = None,
+    top_k: int = 5,
+    available_stay_ids: Optional[List[str]] = None,
+) -> RecommendResponse:
+    """
+    Stay-only recommendations — called by POST /recommend/stays.
+    Only fetches t2s_embedding; skips guide and activity computation entirely.
+    """
+    row = (
+        get_supabase()
+        .table("tourist_profile")
+        .select("id, budget, t2s_embedding")
+        .eq("id", tourist_id)
+        .single()
+        .execute()
+    ).data
+    if not row:
+        raise ValueError(f"tourist_profile not found: {tourist_id}")
+
+    t2s = row.get("t2s_embedding")
+    if not t2s:
+        log.info("Tourist %s: missing t2s vector, recomputing all three", tourist_id)
+        t2s = upsert_tourist_embedding(tourist_id)["stay"]
+
+    tourist_budget = row.get("budget", "")
+    raw_stays = _knn_stays(t2s, city, n=top_k, available_ids=available_stay_ids)
     stay_results: List[StayResult] = []
-    seen_stays: set = set()
+    seen: set = set()
     for st in raw_stays:
         sid = str(st.get("stay_id", ""))
-        if sid in seen_stays:
+        if sid in seen:
             continue
-        seen_stays.add(sid)
+        seen.add(sid)
         vec_sim = float(st.get("vec_sim", 0))
         budget_bonus = _budget_bonus(tourist_budget, st.get("budget", ""))
-        final = round(
-            s.rerank_vec_weight * vec_sim + s.rerank_budget_weight * budget_bonus, 4
-        )
+        final = round(s.rerank_vec_weight * vec_sim + s.rerank_budget_weight * budget_bonus, 4)
         labels = _get_stay_labels(sid)
         stay_results.append(StayResult(
             stay_id=sid,
@@ -286,16 +290,44 @@ def recommend(
             break
 
     stay_results.sort(key=lambda r: r.final_score, reverse=True)
+    return RecommendResponse(tourist_id=tourist_id, guides=[], stays=stay_results, activities=[])
 
-    # ── ACTIVITIES ───────────────────────────────────────────────────────────
-    raw_activities = _knn_activities(vecs["activity"], n=top_k)
+
+def recommend_activities(
+    tourist_id: str,
+    city: Optional[str] = None,
+    top_k: int = 5,
+) -> RecommendResponse:
+    """
+    Activity-only recommendations — called by POST /recommend/activities.
+    Only fetches t2a_embedding; skips guide and stay computation entirely.
+    """
+    row = (
+        get_supabase()
+        .table("tourist_profile")
+        .select("id, budget, active_level, t2a_embedding")
+        .eq("id", tourist_id)
+        .single()
+        .execute()
+    ).data
+    if not row:
+        raise ValueError(f"tourist_profile not found: {tourist_id}")
+
+    t2a = row.get("t2a_embedding")
+    if not t2a:
+        log.info("Tourist %s: missing t2a vector, recomputing all three", tourist_id)
+        t2a = upsert_tourist_embedding(tourist_id)["activity"]
+
+    tourist_budget = row.get("budget", "")
+    tourist_active = row.get("active_level", "")
+    raw_activities = _knn_activities(t2a, n=top_k)
     activity_results: List[ActivityResult] = []
-    seen_acts: set = set()
+    seen: set = set()
     for act in raw_activities:
         aid = str(act.get("activity_id", ""))
-        if aid in seen_acts:
+        if aid in seen:
             continue
-        seen_acts.add(aid)
+        seen.add(aid)
         vec_sim = float(act.get("vec_sim", 0))
         budget_bonus = _budget_bonus(tourist_budget, act.get("budget", ""))
         active_bonus = _active_bonus(tourist_active, act.get("difficulty_level", ""))
@@ -322,10 +354,29 @@ def recommend(
             break
 
     activity_results.sort(key=lambda r: r.final_score, reverse=True)
+    return RecommendResponse(tourist_id=tourist_id, guides=[], stays=[], activities=activity_results)
 
+
+# ── Full recommendation (backward-compatible) ─────────────────────────────────
+
+def recommend(
+    tourist_id: str,
+    city: Optional[str] = None,
+    guide_gender: Optional[str] = None,
+    top_k: int = 5,
+    available_guide_ids: Optional[List[str]] = None,
+    available_stay_ids: Optional[List[str]] = None,
+) -> RecommendResponse:
+    """
+    All-in-one — called by POST /recommend (backward-compatible).
+    Delegates to the three focused functions and merges results.
+    """
+    g = recommend_guides(tourist_id, city, guide_gender, top_k, available_guide_ids)
+    st = recommend_stays(tourist_id, city, top_k, available_stay_ids)
+    act = recommend_activities(tourist_id, city, top_k)
     return RecommendResponse(
         tourist_id=tourist_id,
-        guides=guide_results,
-        stays=stay_results,
-        activities=activity_results,
+        guides=g.guides,
+        stays=st.stays,
+        activities=act.activities,
     )
