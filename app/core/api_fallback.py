@@ -17,7 +17,7 @@ import time
 from typing import Any, Callable, Dict
 from functools import wraps
 
-from app.core.config import settings
+from app.core.config import Settings
 
 
 logger = logging.getLogger(__name__)

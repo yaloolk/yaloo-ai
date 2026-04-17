@@ -18,7 +18,7 @@ class WebhookPayload(BaseModel):
     """
     type: str                        # "INSERT" | "UPDATE" | "DELETE"
     table: str
-    schema: str = "public"
+    schema_: str = "public"
     record: Dict[str, Any]           # the new row
     old_record: Optional[Dict[str, Any]] = None
 
