@@ -2,12 +2,10 @@
 app/main.py
 Root FastAPI application.
 """
-import os
+
 import logging
-from scripts.embed_all import run_embed_all  #only for embed_all
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from app.api import recommend, chatbot
 from app.services.vector_service import get_embedding_model
 
@@ -43,13 +41,19 @@ async def startup():
 async def health():
     return {"status": "ok"}
 
-@app.on_event("startup")
-async def startup():
-    get_embedding_model()
+#uncomment below when u only need to tun embed_all file via huggingface 
+#set a secret key in hugging face before starting [Key: RUN_EMBED_ON_START Value: true]
 
-    if os.getenv("RUN_EMBED_ON_START") == "1":
-        logging.info("RUN_EMBED_ON_START=1 — running embed backfill ...")
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
-        logging.info("Embed backfill finished.")
+# import os
+# from scripts.embed_all import run_embed_all 
+
+# @app.on_event("startup")
+# async def startup():
+#     get_embedding_model()
+
+#     if os.getenv("RUN_EMBED_ON_START") == "1":
+#         logging.info("RUN_EMBED_ON_START=1 — running embed backfill ...")
+#         import asyncio
+#         loop = asyncio.get_event_loop()
+#         await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
+#         logging.info("Embed backfill finished.")
