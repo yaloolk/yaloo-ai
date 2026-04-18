@@ -3,7 +3,7 @@ app/main.py
 Root FastAPI application.
 """
 import logging
-
+from scripts.embed_all import run_embed_all  #only for embed_all
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -41,3 +41,15 @@ async def startup():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.on_event("startup")
+async def startup():
+    """Pre-load the embedding model so the first request isn't slow."""
+    get_embedding_model()
+
+    if os.getenv("RUN_EMBED_ON_START") == 1:
+        log.info("RUN_EMBED_ON_START=true — running embed backfill ...")
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
+        log.info("Embed backfill finished.")
