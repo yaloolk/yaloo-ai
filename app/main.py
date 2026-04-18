@@ -44,17 +44,16 @@ async def health():
 #uncomment below when u only need to tun embed_all file via huggingface 
 #set a secret key in hugging face before starting [Key: RUN_EMBED_ON_START Value: true]
 
-import os
-from scripts.embed_all import run_embed_all 
+# import os
+# from scripts.embed_all import run_embed_all 
 
-@app.on_event("startup")
-async def startup():
-    get_embedding_model()
+# @app.on_event("startup")
+# async def startup():
+#     get_embedding_model()
 
-    if os.getenv("RUN_EMBED_ON_START") == "1":
-        logging.info("RUN_EMBED_ON_START=1 — running embed backfill ...")
-        import asyncio
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
-        logging.info("Embed backfill finished.")
-        
+#     if os.getenv("RUN_EMBED_ON_START") == "1":
+#         logging.info("RUN_EMBED_ON_START=1 — running embed backfill ...")
+#         import asyncio
+#         loop = asyncio.get_event_loop()
+#         await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
+#         logging.info("Embed backfill finished.")
