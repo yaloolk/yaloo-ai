@@ -77,7 +77,7 @@ def _guide_id_from_user(user_profile_id: str) -> Optional[str]:
 
 
 def _stay_ids_from_host(host_id: str) -> list:
-    """Return all stay.id rows for a given host_id."""
+    """Return all stay.id rows for a given host_profile.id."""
     rows = (
         get_supabase()
         .table("stay")
@@ -101,19 +101,6 @@ def _tourist_id_from_user(user_profile_id: str) -> Optional[str]:
     return row["id"] if row else None
 
 
-def _host_id_from_user(user_profile_id: str) -> Optional[str]:
-    """Return host_profile's user_profile_id (host_id) — same value, just confirms they're a host."""
-    row = (
-        get_supabase()
-        .table("host_profile")
-        .select("user_profile_id")
-        .eq("user_profile_id", user_profile_id)
-        .maybe_single()
-        .execute()
-    ).data
-    return row["user_profile_id"] if row else None
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUIDE WEBHOOKS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -126,8 +113,6 @@ async def embed_guide(
     """
     Supabase webhook:
       Table: guide_profile | Events: INSERT, UPDATE
-    What changed: any field on guide_profile itself
-    (experience_years, rate_per_hour, avg_rating, active_level, city_id, is_available)
     """
     _verify(x_webhook_secret)
     guide_id = payload.record.get("id")
@@ -145,10 +130,8 @@ async def embed_guide_by_specialization(
     """
     Supabase webhook:
       Table: guide_specialization | Events: INSERT, DELETE
-    What changed: guide added or removed a specialization
     """
     _verify(x_webhook_secret)
-    # On DELETE, record may be the deleted row — use old_record if available
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
     guide_id = rec.get("guide_profile_id")
     if not guide_id:
@@ -166,9 +149,6 @@ async def embed_guide_by_user(
     Supabase webhooks (register BOTH separately in Dashboard):
       Table: user_interest | Events: INSERT, DELETE
       Table: user_language | Events: INSERT, DELETE
-    What changed: guide added/removed an interest or language
-    Note: these same tables also trigger /embed/tourist/invalidate — add that
-    as a second webhook row for the same table in Supabase Dashboard.
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -178,7 +158,6 @@ async def embed_guide_by_user(
 
     guide_id = _guide_id_from_user(user_profile_id)
     if not guide_id:
-        # This user is a tourist, not a guide — totally normal
         return {"status": "skipped", "reason": "not_a_guide"}
 
     ok = vector_service.upsert_guide_embedding(guide_id)
@@ -193,9 +172,6 @@ async def embed_guide_by_local_activity(
     """
     Supabase webhook:
       Table: local_activity | Events: INSERT, UPDATE, DELETE
-    What changed: a guide added/removed/changed a local activity they offer
-    Note: local_activity ALSO affects stays (via host_id) — register a second
-    webhook on the same table pointing to /embed/stay/by-local-activity.
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -220,7 +196,6 @@ async def embed_stay(
     """
     Supabase webhook:
       Table: stay | Events: INSERT, UPDATE
-    What changed: stay name, type, description, budget, price_per_night, city_id
     """
     _verify(x_webhook_secret)
     stay_id = payload.record.get("id")
@@ -238,7 +213,6 @@ async def embed_stay_by_ambiance(
     """
     Supabase webhook:
       Table: stay_ambiance | Events: INSERT, DELETE
-    What changed: stay added or removed an ambiance tag
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -257,7 +231,6 @@ async def embed_stay_by_suitable_for(
     """
     Supabase webhook:
       Table: stay_suitable_for | Events: INSERT, DELETE
-    What changed: stay added or removed a suitable_for tag
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -276,9 +249,6 @@ async def embed_stay_by_local_activity(
     """
     Supabase webhook (second registration on local_activity):
       Table: local_activity | Events: INSERT, UPDATE, DELETE
-    What changed: a host added/removed/changed an activity — affects all their stays
-    Note: this is a SECOND webhook row on local_activity in Supabase Dashboard.
-    The first points to /embed/guide/by-local-activity.
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -307,9 +277,10 @@ async def embed_stay_by_host(
     """
     Supabase webhook:
       Table: host_profile | Events: UPDATE
-    What changed: host avg_rating changed — re-embed all their stays
-    avg_rating is joined from host_profile into stay text via fetch_stay_row()
-    so a rating change must trigger stay re-embed.
+    What changed: host avg_rating changed — re-embed all their stays.
+
+    FIX: stay.host_id = host_profile.id (NOT host_profile.user_profile_id).
+    We must use rec.get("id") — the host_profile PK — not user_profile_id.
     """
     _verify(x_webhook_secret)
 
@@ -319,9 +290,10 @@ async def embed_stay_by_host(
     if rec.get("avg_rating") == old.get("avg_rating"):
         return {"status": "skipped", "reason": "avg_rating_unchanged"}
 
-    host_id = rec.get("user_profile_id")
+    # FIX: use host_profile.id (= stay.host_id), not user_profile_id
+    host_id = rec.get("id")
     if not host_id:
-        raise HTTPException(400, "record.user_profile_id missing")
+        raise HTTPException(400, "record.id missing")
 
     stay_ids = _stay_ids_from_host(host_id)
     if not stay_ids:
@@ -347,7 +319,6 @@ async def embed_activity(
     """
     Supabase webhook:
       Table: activity | Events: INSERT, UPDATE
-    What changed: activity name, category, description, budget, difficulty_level, base_price
     """
     _verify(x_webhook_secret)
     activity_id = payload.record.get("id")
@@ -365,7 +336,6 @@ async def embed_activity_by_suitable_for(
     """
     Supabase webhook:
       Table: activity_suitable_for | Events: INSERT, DELETE
-    What changed: activity added or removed a suitable_for tag
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -389,9 +359,6 @@ async def invalidate_tourist(
     Supabase webhooks (register BOTH separately in Dashboard):
       Table: user_interest | Events: INSERT, DELETE
       Table: user_language | Events: INSERT, DELETE
-    What changed: tourist added/removed an interest or language
-    Action: null out t2g, t2s, t2a embeddings so next /recommend call recomputes it fresh
-    Note: these same tables also trigger /embed/guide/by-user.
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
@@ -401,7 +368,6 @@ async def invalidate_tourist(
 
     tourist_id = _tourist_id_from_user(user_profile_id)
     if not tourist_id:
-        # This user is a guide, not a tourist — totally normal
         return {"status": "skipped", "reason": "not_a_tourist"}
 
     vector_service.invalidate_tourist_embedding(tourist_id)
@@ -416,9 +382,6 @@ async def embed_tourist_by_profile(
     """
     Supabase webhook:
       Table: tourist_profile | Events: UPDATE
-    What changed: travel_style, budget, or active_level on tourist_profile
-    Action: invalidate svector — lazily recomputed on next /recommend call
-    Skips re-embed if none of the embedding-relevant fields actually changed.
     """
     _verify(x_webhook_secret)
     tourist_id = payload.record.get("id")
@@ -447,14 +410,6 @@ async def embed_user_profile_update(
     """
     Supabase webhook:
       Table: user_profile | Events: UPDATE
-    What changed: first_name, last_name, profile_bio, or gender
-    These fields are joined into BOTH guide and tourist embeddings via fetch_guide_row()
-    and fetch_tourist_row(), so a change here must update both if applicable.
-
-    Action:
-      - If this user is a guide  → re-embed guide_profile
-      - If this user is a tourist → invalidate tourist svector
-      - Skips if neither relevant field changed
     """
     _verify(x_webhook_secret)
 
@@ -464,13 +419,11 @@ async def embed_user_profile_update(
     if not user_profile_id:
         raise HTTPException(400, "record.id missing")
 
-    # Only act if embedding-relevant fields changed
     guide_fields   = ("first_name", "last_name", "profile_bio", "gender")
     tourist_fields = ("profile_bio",)
 
     results = {}
 
-    # Guide side
     if any(rec.get(f) != old.get(f) for f in guide_fields):
         guide_id = _guide_id_from_user(user_profile_id)
         if guide_id:
@@ -479,7 +432,6 @@ async def embed_user_profile_update(
         else:
             results["guide"] = "skipped_not_a_guide"
 
-    # Tourist side
     if any(rec.get(f) != old.get(f) for f in tourist_fields):
         tourist_id = _tourist_id_from_user(user_profile_id)
         if tourist_id:
@@ -506,9 +458,6 @@ async def embed_doc(
     """
     Supabase webhook:
       Table: doc_source | Events: INSERT, UPDATE, DELETE
-    What changed:
-      INSERT/UPDATE → fetch URL, re-chunk, re-embed, store in doc_chunk
-      DELETE        → chunks removed automatically via ON DELETE CASCADE
     """
     _verify(x_webhook_secret)
 
@@ -528,15 +477,11 @@ async def embed_doc(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RECOMMENDATION ENDPOINTS  (split by type for faster, targeted calls)
+# RECOMMENDATION ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.post("/recommend/guides", response_model=RecommendResponse)
 async def recommend_guides(req: RecommendRequest):
-    """
-    Return only guide recommendations for the tourist.
-    Use this when you only need guides — avoids computing stays & activities.
-    """
     try:
         result = rec_engine.recommend_guides(
             tourist_id=req.tourist_id,
@@ -555,10 +500,6 @@ async def recommend_guides(req: RecommendRequest):
 
 @router.post("/recommend/stays", response_model=RecommendResponse)
 async def recommend_stays(req: RecommendRequest):
-    """
-    Return only stay recommendations for the tourist.
-    Use this when you only need stays — avoids computing guides & activities.
-    """
     try:
         result = rec_engine.recommend_stays(
             tourist_id=req.tourist_id,
@@ -576,10 +517,6 @@ async def recommend_stays(req: RecommendRequest):
 
 @router.post("/recommend/activities", response_model=RecommendResponse)
 async def recommend_activities(req: RecommendRequest):
-    """
-    Return only activity recommendations for the tourist.
-    Use this when you only need activities — avoids computing guides & stays.
-    """
     try:
         result = rec_engine.recommend_activities(
             tourist_id=req.tourist_id,
@@ -596,11 +533,6 @@ async def recommend_activities(req: RecommendRequest):
 
 @router.post("/recommend", response_model=RecommendResponse)
 async def get_recommendations(req: RecommendRequest):
-    """
-    Return all recommendations (guides + stays + activities) in one call.
-    Kept for backward compatibility — prefer the split endpoints above
-    when you only need one type.
-    """
     try:
         result = rec_engine.recommend(
             tourist_id=req.tourist_id,

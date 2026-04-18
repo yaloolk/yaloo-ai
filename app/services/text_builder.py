@@ -14,7 +14,6 @@ from typing import Any, Dict, Optional
 
 
 # ── Field weights ─────────────────────────────────────────────────────────────
-# Same as notebook.  Higher weight = repeated more times before embedding.
 
 TOURIST_W: Dict[str, int] = {
     "travel_style":  4,
@@ -31,7 +30,7 @@ GUIDE_W: Dict[str, int] = {
     "profile_bio":     3,
     "active_level":    2,
     "languages":       2,
-    "local_activities": 1,   # new — activities the guide personally offers
+    "local_activities": 1,
 }
 
 STAY_W: Dict[str, int] = {
@@ -40,7 +39,7 @@ STAY_W: Dict[str, int] = {
     "description":     3,
     "budget":          3,
     "type":            2,
-    "local_activities": 1,   # new — activities the host offers at the stay
+    "local_activities": 1,
 }
 
 ACTIVITY_W: Dict[str, int] = {
@@ -53,8 +52,6 @@ ACTIVITY_W: Dict[str, int] = {
 
 
 # ── Travel-style bridge strings ───────────────────────────────────────────────
-# Appended to tourist text when querying stays / activities.
-# Preserved verbatim from notebook.
 
 TRAVEL_TO_STAY: Dict[str, str] = {
     "adventure":   "outdoor rustic eco jungle mountain trek wild adventure seekers hiking",
@@ -86,6 +83,10 @@ TRAVEL_TO_ACTIVITY: Dict[str, str] = {
 def _is_valid(val: Any) -> bool:
     if val is None:
         return False
+    # FIX: treat numeric zero as missing — experience_years=0 or
+    # rate_per_hour=0.0 means "not set", not a meaningful embedding signal.
+    if isinstance(val, (int, float)) and val == 0:
+        return False
     s = str(val).strip()
     return s not in ("", "nan", "None", "NaN", "null")
 
@@ -106,29 +107,24 @@ def row_to_text(row: Dict[str, Any], weights: Dict[str, int]) -> str:
 # ── Per-entity text functions ─────────────────────────────────────────────────
 
 def guide_text(row: Dict[str, Any]) -> str:
-    """Text for embedding a guide (used as the guide-side vector)."""
     return row_to_text(row, GUIDE_W)
 
 
 def stay_text(row: Dict[str, Any]) -> str:
-    """Text for embedding a stay (used as the stay-side vector)."""
     return row_to_text(row, STAY_W)
 
 
 def activity_text(row: Dict[str, Any]) -> str:
-    """Text for embedding a global activity."""
     return row_to_text(row, ACTIVITY_W)
 
 
 # ── Tourist text — three variants depending on query target ───────────────────
 
 def tourist_text_for_guide(row: Dict[str, Any]) -> str:
-    """Tourist query vector used when searching guides."""
     return row_to_text(row, TOURIST_W)
 
 
 def tourist_text_for_stay(row: Dict[str, Any]) -> str:
-    """Tourist query vector used when searching stays (adds bridge string)."""
     base = row_to_text(row, TOURIST_W)
     style = str(row.get("travel_style", "")).lower().strip()
     bridge = TRAVEL_TO_STAY.get(style, "")
@@ -136,7 +132,6 @@ def tourist_text_for_stay(row: Dict[str, Any]) -> str:
 
 
 def tourist_text_for_activity(row: Dict[str, Any]) -> str:
-    """Tourist query vector used when searching activities (adds bridge string)."""
     base = row_to_text(row, TOURIST_W)
     style = str(row.get("travel_style", "")).lower().strip()
     bridge = TRAVEL_TO_ACTIVITY.get(style, "")

@@ -107,47 +107,27 @@ def _detect_intent_text(text: str) -> str:
 
 
 def _scan_intent(messages) -> str:
-    """
-    Determine intent for the current turn.
-
-    The key rule: only inherit 'recommend' from history if the conversation
-    is STILL in the pending state — i.e. the bot asked for a city and has
-    not yet delivered a recommendation.
-
-    'Pending' means: recommend intent was found in history AND no city has
-    appeared in any turn up to (but not including) the current user message.
-
-    Once a city was provided and a recommendation delivered, the tourist is
-    free to ask anything else and it classifies on its own merits.
-    """
     user_msgs = [m for m in messages if m.role == "user"]
     if not user_msgs:
         return "general"
 
-    # Always classify the current message first
     current_intent = _detect_intent_text(user_msgs[-1].content)
     if current_intent != "general":
         return current_intent
 
-    # Current message is "general" (e.g. bare city reply "Colombo", or "what's the climate?")
-    # Only inherit recommend from history if we are still waiting for city input.
-    # "Waiting" = recommend found in a prior turn AND no city found in any prior turn.
-    prior_msgs = messages[:-1]  # all turns before the current user message
+    prior_msgs = messages[:-1]
     prior_user_msgs = [m for m in prior_msgs if m.role == "user"]
 
     prior_had_recommend = any(
         _detect_intent_text(m.content) == "recommend" for m in prior_user_msgs
     )
     prior_had_city = any(
-        _extract_city(m.content) for m in prior_msgs  # includes bot turns
+        _extract_city(m.content) for m in prior_msgs
     )
 
     if prior_had_recommend and not prior_had_city:
-        # Bot asked for city, tourist is now replying with it — stay in recommend
         return "recommend"
 
-    # Otherwise: recommendation already delivered, or no prior recommend.
-    # Let the current message stand as "general".
     return "general"
 
 
@@ -168,10 +148,7 @@ def _scan_entity(messages) -> Optional[str]:
 
 
 # ── Date extractor ────────────────────────────────────────────────────────────
-# Scans user turns for a travel date. Supports common formats and relative
-# expressions. Returns an ISO date string (YYYY-MM-DD) or None.
 
-# Relative-word patterns (today / tomorrow / next <weekday>)
 _REL_DATE_PATTERNS = [
     (re.compile(r"\btoday\b", re.I),    lambda: date.today()),
     (re.compile(r"\btomorrow\b", re.I), lambda: date.today() + timedelta(days=1)),
@@ -185,13 +162,9 @@ _MONTH_MAP = {
     "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
 }
 
-# Absolute date patterns: "15 March", "March 15", "15/03/2025", "2025-03-15"
 _ABS_DATE_PATTERNS = [
-    # ISO: 2025-03-15
     re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
-    # d/m/yyyy or d/m/yy
     re.compile(r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})\b"),
-    # "15 March" / "15th March" / "March 15" / "March 15th"
     re.compile(
         r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|"
         r"apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|"
@@ -208,18 +181,17 @@ _ABS_DATE_PATTERNS = [
 
 
 def _parse_abs_date(m: re.Match, pattern_idx: int) -> Optional[date]:
-    """Try to parse a regex match into a date. Returns None on failure."""
     today = date.today()
     try:
         g = m.groups()
-        if pattern_idx == 0:          # ISO yyyy-mm-dd
+        if pattern_idx == 0:
             return date(int(g[0]), int(g[1]), int(g[2]))
-        if pattern_idx == 1:          # d/m/yyyy
+        if pattern_idx == 1:
             d, mo, y = int(g[0]), int(g[1]), int(g[2])
             if y < 100:
                 y += 2000
             return date(y, mo, d)
-        if pattern_idx == 2:          # "15 March"
+        if pattern_idx == 2:
             d  = int(g[0])
             mo = _MONTH_MAP.get(g[1].lower()[:3])
             if not mo:
@@ -229,7 +201,7 @@ def _parse_abs_date(m: re.Match, pattern_idx: int) -> Optional[date]:
             if candidate < today:
                 candidate = date(y + 1, mo, d)
             return candidate
-        if pattern_idx == 3:          # "March 15"
+        if pattern_idx == 3:
             mo = _MONTH_MAP.get(g[0].lower()[:3])
             d  = int(g[1])
             if not mo:
@@ -245,10 +217,6 @@ def _parse_abs_date(m: re.Match, pattern_idx: int) -> Optional[date]:
 
 
 def _scan_date(messages) -> Optional[str]:
-    """
-    Scan all user turns oldest→newest for a travel date mention.
-    Returns ISO string 'YYYY-MM-DD' of the most recently mentioned date, or None.
-    """
     found: Optional[date] = None
 
     for msg in messages:
@@ -256,12 +224,10 @@ def _scan_date(messages) -> Optional[str]:
             continue
         text = msg.content
 
-        # Relative expressions
         for pattern, resolver in _REL_DATE_PATTERNS:
             if pattern.search(text):
                 found = resolver()
 
-        # "next <weekday>"
         nw = re.search(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", text, re.I)
         if nw:
             target_wd = _WEEKDAYS.index(nw.group(1).lower())
@@ -269,7 +235,6 @@ def _scan_date(messages) -> Optional[str]:
             delta     = (target_wd - today_wd) % 7 or 7
             found = date.today() + timedelta(days=delta)
 
-        # Absolute date patterns
         for idx, pat in enumerate(_ABS_DATE_PATTERNS):
             m = pat.search(text)
             if m:
@@ -280,6 +245,28 @@ def _scan_date(messages) -> Optional[str]:
     return found.isoformat() if found else None
 
 
+# ── City ID lookup helper ─────────────────────────────────────────────────────
+
+def _get_city_id(city: str) -> Optional[str]:
+    """
+    Resolve a city name to its city.id for FK-based filtering.
+    guide_profile and stay both store city_id, not city_name.
+    """
+    try:
+        row = (
+            get_supabase()
+            .table("city")
+            .select("id")
+            .ilike("name", city)
+            .maybe_single()
+            .execute()
+        ).data
+        return row["id"] if row else None
+    except Exception as e:
+        log.warning("_get_city_id failed for '%s': %s", city, e)
+        return None
+
+
 # ── Availability helpers ──────────────────────────────────────────────────────
 
 def _available_guide_ids(city: Optional[str], travel_date: Optional[str]) -> Optional[List[str]]:
@@ -287,47 +274,52 @@ def _available_guide_ids(city: Optional[str], travel_date: Optional[str]) -> Opt
     Return guide_profile IDs available on travel_date in city.
     Returns None (no filter) if date is not provided.
     Returns [] if date provided but no guides available (hard filter).
+
+    FIX: guide_profile has city_id (FK), not city_name.
+    Resolve city name → city_id first, then filter on city_id.
     """
     if not travel_date:
         return None
     try:
-        db = get_supabase()
-        q  = (
+        db   = get_supabase()
+        rows = (
             db.table("guide_availability")
             .select("guide_profile_id")
             .eq("available_date", travel_date)
             .eq("is_available", True)
-        )
-        if city:
-            # Join via guide_profile to filter by city_name
-            # Supabase doesn't support cross-table filters in .select directly,
-            # so fetch all available guides then intersect with city filter below.
-            pass
-        rows = q.execute().data or []
-        ids  = [r["guide_profile_id"] for r in rows]
+            .execute()
+        ).data or []
+        ids = [r["guide_profile_id"] for r in rows]
 
         if city and ids:
-            # Filter to guides in the requested city
-            city_rows = (
-                db.table("guide_profile")
-                .select("id")
-                .in_("id", ids)
-                .ilike("city_name", city)
-                .execute()
-            ).data or []
-            ids = [r["id"] for r in city_rows]
+            city_id = _get_city_id(city)
+            if city_id:
+                city_rows = (
+                    db.table("guide_profile")
+                    .select("id")
+                    .in_("id", ids)
+                    .eq("city_id", city_id)
+                    .execute()
+                ).data or []
+                ids = [r["id"] for r in city_rows]
+            else:
+                # City not found in DB — return unfiltered rather than empty
+                log.warning("City '%s' not found in city table; skipping city filter for guides", city)
 
         log.info("Available guides on %s in %s: %d", travel_date, city, len(ids))
         return ids
     except Exception as e:
         log.warning("_available_guide_ids failed: %s", e)
-        return None  # fail open — don't block recommendations
+        return None  # fail open
 
 
 def _available_stay_ids(city: Optional[str], travel_date: Optional[str]) -> Optional[List[str]]:
     """
     Return stay IDs available on travel_date.
     Returns None if date not provided; [] if date provided but nothing available.
+
+    FIX: stay has city_id (FK), not city_name.
+    Resolve city name → city_id first, then filter on city_id.
     """
     if not travel_date:
         return None
@@ -340,17 +332,21 @@ def _available_stay_ids(city: Optional[str], travel_date: Optional[str]) -> Opti
             .eq("is_available", True)
             .execute()
         ).data or []
-        ids  = [r["stay_id"] for r in rows]
+        ids = [r["stay_id"] for r in rows]
 
         if city and ids:
-            city_rows = (
-                db.table("stay")
-                .select("id")
-                .in_("id", ids)
-                .ilike("city_name", city)
-                .execute()
-            ).data or []
-            ids = [r["id"] for r in city_rows]
+            city_id = _get_city_id(city)
+            if city_id:
+                city_rows = (
+                    db.table("stay")
+                    .select("id")
+                    .in_("id", ids)
+                    .eq("city_id", city_id)
+                    .execute()
+                ).data or []
+                ids = [r["id"] for r in city_rows]
+            else:
+                log.warning("City '%s' not found in city table; skipping city filter for stays", city)
 
         log.info("Available stays on %s in %s: %d", travel_date, city, len(ids))
         return ids
@@ -368,7 +364,7 @@ def _fetch_linked_providers(activity_ids: list) -> str:
         db    = get_supabase()
         rows  = (
             db.table("local_activity")
-            .select("activity_id, guide_id, stay_id")
+            .select("activity_id, guide_id, host_id")
             .in_("activity_id", activity_ids)
             .execute()
         ).data or []
@@ -376,40 +372,49 @@ def _fetch_linked_providers(activity_ids: list) -> str:
             return ""
 
         guide_ids = list({r["guide_id"] for r in rows if r.get("guide_id")})
-        stay_ids  = list({r["stay_id"]  for r in rows if r.get("stay_id")})
+        stay_ids  = list({r["host_id"]  for r in rows if r.get("host_id")})
         lines: List[str] = []
 
         if guide_ids:
+            # FIX: guide_profile has no full_name column.
+            # Join user_profile to get first_name + last_name.
             g_rows = (
                 db.table("guide_profile")
-                .select("id, full_name, avg_rating, rate_per_hour")
+                .select("id, avg_rating, rate_per_hour, user_profile:user_profile_id(first_name, last_name)")
                 .in_("id", guide_ids)
                 .execute()
             ).data or []
             if g_rows:
                 lines.append("Guides who offer these activities:")
                 for g in g_rows:
+                    up = g.get("user_profile") or {}
+                    full_name = f"{up.get('first_name', '')} {up.get('last_name', '')}".strip() or "?"
                     lines.append(
-                        f"  {g.get('full_name','?')} | "
+                        f"  {full_name} | "
                         f"Rating {g.get('avg_rating') or '?'} | "
                         f"LKR {g.get('rate_per_hour') or '?'}/hr"
                     )
 
         if stay_ids:
+            # FIX: stay has no avg_rating column — it lives on host_profile.
+            # Join host_profile to get avg_rating.
+            # Note: local_activity.host_id = host_profile.id = stay.host_id,
+            # so stay_ids here are actually host_profile IDs — fetch stays by host_id.
             s_rows = (
                 db.table("stay")
-                .select("id, name, budget, price_per_night, avg_rating")
-                .in_("id", stay_ids)
+                .select("id, name, budget, price_per_night, host_profile:host_id(avg_rating)")
+                .in_("host_id", stay_ids)
                 .execute()
             ).data or []
             if s_rows:
                 lines.append("Stays that offer these activities:")
                 for st in s_rows:
+                    hp = st.get("host_profile") or {}
                     lines.append(
-                        f"  {st.get('name','?')} | "
+                        f"  {st.get('name', '?')} | "
                         f"{st.get('budget') or 'N/A'} | "
                         f"LKR {st.get('price_per_night') or '?'}/night | "
-                        f"Rating {st.get('avg_rating') or '?'}"
+                        f"Rating {hp.get('avg_rating') or '?'}"
                     )
         return "\n".join(lines)
     except Exception as e:
@@ -423,10 +428,6 @@ def _fetch_recommendation_context(
     entity: Optional[str],
     travel_date: Optional[str],
 ) -> str:
-    """
-    Call only the rec_engine function needed for the detected entity type.
-    Passes availability-filtered IDs when a travel date was detected.
-    """
     lines: List[str] = []
 
     def _fmt_guides(guides) -> None:
@@ -490,7 +491,6 @@ def _fetch_recommendation_context(
                 lines.append(linked)
 
         else:
-            # All three — apply availability filters to guides and stays
             avail_g = _available_guide_ids(city, travel_date)
             avail_s = _available_stay_ids(city, travel_date)
             result  = rec_engine.recommend(

@@ -8,9 +8,6 @@ Tourist embedding columns (three separate vectors):
   t2s_embedding  → used when querying stays
   t2a_embedding  → used when querying activities
 
-All three are stored in tourist_profile and read together on each
-/recommend call. If any is NULL the full set is recomputed atomically.
-
 Scoring:
   Guides     : final = vec_sim                          (pure cosine)
   Stays      : final = 0.80*vec_sim + 0.12*budget_bonus
@@ -138,8 +135,16 @@ def _get_activity_labels(activity_id: str) -> str:
     return ", ".join(r["label"] for r in rows)
 
 
-def _get_guide_labels(user_profile_id: str) -> Dict[str, str]:
+def _get_guide_labels(user_profile_id: str, guide_profile_id: str) -> Dict[str, str]:
+    """
+    Fetch interests, languages, and specializations for a guide.
+
+    FIX: Added guide_profile_id parameter and specializations fetch.
+    interests/languages are keyed on user_profile_id;
+    specializations are keyed on guide_profile_id.
+    """
     db = get_supabase()
+
     int_rows = db.table("user_interest").select("interest_id").eq("user_profile_id", user_profile_id).execute().data or []
     int_ids = [r["interest_id"] for r in int_rows]
     interests = ""
@@ -154,23 +159,15 @@ def _get_guide_labels(user_profile_id: str) -> Dict[str, str]:
         rows = db.table("language").select("name").in_("id", lang_ids).execute().data or []
         languages = ", ".join(r["name"] for r in rows)
 
-    return {"interests": interests, "languages": languages}
+    # FIX: fetch specializations using guide_profile_id (not user_profile_id)
+    spec_rows = db.table("guide_specialization").select("specialization_id").eq("guide_profile_id", guide_profile_id).execute().data or []
+    spec_ids = [r["specialization_id"] for r in spec_rows]
+    specializations = ""
+    if spec_ids:
+        rows = db.table("specialization").select("label").in_("id", spec_ids).execute().data or []
+        specializations = ", ".join(r["label"] for r in rows)
 
-
-
-# ── Tourist profile helper ────────────────────────────────────────────────────
-
-def _get_tourist_profile(tourist_id: str) -> Dict[str, str]:
-    """Fetch budget and active_level from tourist_profile."""
-    tp = (
-        get_supabase()
-        .table("tourist_profile")
-        .select("budget, active_level")
-        .eq("id", tourist_id)
-        .single()
-        .execute()
-    ).data or {}
-    return tp
+    return {"interests": interests, "languages": languages, "specializations": specializations}
 
 
 # ── Public focused recommendation functions ───────────────────────────────────
@@ -182,10 +179,6 @@ def recommend_guides(
     top_k: int = 5,
     available_guide_ids: Optional[List[str]] = None,
 ) -> RecommendResponse:
-    """
-    Guide-only recommendations — called by POST /recommend/guides.
-    Only fetches t2g_embedding; skips stay and activity computation entirely.
-    """
     row = (
         get_supabase()
         .table("tourist_profile")
@@ -211,7 +204,11 @@ def recommend_guides(
             continue
         seen.add(gid)
         vec_sim = float(g.get("vec_sim", 0))
-        labels = _get_guide_labels(str(g.get("user_profile_id", "")))
+        # FIX: pass both user_profile_id and guide_profile_id
+        labels = _get_guide_labels(
+            str(g.get("user_profile_id", "")),
+            gid,
+        )
         guide_results.append(GuideResult(
             guide_profile_id=gid,
             user_profile_id=str(g.get("user_profile_id", "")),
@@ -221,8 +218,8 @@ def recommend_guides(
             avg_rating=g.get("avg_rating"),
             experience_years=g.get("experience_years"),
             rate_per_hour=g.get("rate_per_hour"),
-            specializations=None,
-            languages=labels.get("languages"),
+            specializations=labels.get("specializations") or None,
+            languages=labels.get("languages") or None,
             profile_bio=g.get("profile_bio"),
             vec_sim=round(vec_sim, 4),
             final_score=round(vec_sim, 4),
@@ -239,10 +236,6 @@ def recommend_stays(
     top_k: int = 5,
     available_stay_ids: Optional[List[str]] = None,
 ) -> RecommendResponse:
-    """
-    Stay-only recommendations — called by POST /recommend/stays.
-    Only fetches t2s_embedding; skips guide and activity computation entirely.
-    """
     row = (
         get_supabase()
         .table("tourist_profile")
@@ -298,10 +291,6 @@ def recommend_activities(
     city: Optional[str] = None,
     top_k: int = 5,
 ) -> RecommendResponse:
-    """
-    Activity-only recommendations — called by POST /recommend/activities.
-    Only fetches t2a_embedding; skips guide and stay computation entirely.
-    """
     row = (
         get_supabase()
         .table("tourist_profile")
@@ -367,11 +356,7 @@ def recommend(
     available_guide_ids: Optional[List[str]] = None,
     available_stay_ids: Optional[List[str]] = None,
 ) -> RecommendResponse:
-    """
-    All-in-one — called by POST /recommend (backward-compatible).
-    Delegates to the three focused functions and merges results.
-    """
-    g = recommend_guides(tourist_id, city, guide_gender, top_k, available_guide_ids)
+    g  = recommend_guides(tourist_id, city, guide_gender, top_k, available_guide_ids)
     st = recommend_stays(tourist_id, city, top_k, available_stay_ids)
     act = recommend_activities(tourist_id, city, top_k)
     return RecommendResponse(
