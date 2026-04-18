@@ -248,6 +248,22 @@ def main():
     log.info("  UNION ALL SELECT 'tourist t2a',  COUNT(t2a_embedding)  FROM tourist_profile")
     log.info("  UNION ALL SELECT 'doc_chunks',   COUNT(embedding)      FROM doc_chunk;")
 
+def run_embed_all(only_nulls: bool = True) -> None:
+    """Callable entry point for programmatic use (e.g. startup hook)."""
+    log.info("Pre-loading embedding model ...")
+    get_embedding_model()
+    log.info("Model ready.\n")
 
+    mode = "NULL rows only" if only_nulls else "all rows"
+    log.info("Mode: %s\n", mode)
+
+    _backfill("guides",     _guide_ids(only_nulls),    upsert_guide_embedding)
+    _backfill("stays",      _stay_ids(only_nulls),     upsert_stay_embedding)
+    _backfill("activities", _activity_ids(only_nulls), upsert_activity_embedding)
+    _backfill("tourists (t2g+t2s+t2a)", _tourist_ids(only_nulls), _tourist_upsert)
+    _embed_docs(only_nulls)
+
+    log.info("Backfill complete.")
+    
 if __name__ == "__main__":
     main()
