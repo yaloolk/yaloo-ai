@@ -248,6 +248,8 @@ def main():
     log.info("  UNION ALL SELECT 'tourist t2a',  COUNT(t2a_embedding)  FROM tourist_profile")
     log.info("  UNION ALL SELECT 'doc_chunks',   COUNT(embedding)      FROM doc_chunk;")
 
+#uncomment below when u need to run embed_all.py
+
 def run_embed_all(only_nulls: bool = True) -> None:
     """Callable entry point for programmatic use (e.g. startup hook)."""
     log.info("Pre-loading embedding model ...")
@@ -264,6 +266,6 @@ def run_embed_all(only_nulls: bool = True) -> None:
     _embed_docs(only_nulls)
 
     log.info("Backfill complete.")
-    
+
 if __name__ == "__main__":
     main()
