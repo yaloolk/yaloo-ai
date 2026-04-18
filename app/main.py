@@ -2,6 +2,7 @@
 app/main.py
 Root FastAPI application.
 """
+import os
 import logging
 from scripts.embed_all import run_embed_all  #only for embed_all
 from fastapi import FastAPI
@@ -47,7 +48,7 @@ async def startup():
     """Pre-load the embedding model so the first request isn't slow."""
     get_embedding_model()
 
-    if os.getenv("RUN_EMBED_ON_START") == 1:
+    if os.getenv("RUN_EMBED_ON_START") == "1":
         log.info("RUN_EMBED_ON_START=true — running embed backfill ...")
         import asyncio
         loop = asyncio.get_event_loop()
