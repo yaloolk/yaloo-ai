@@ -45,12 +45,11 @@ async def health():
 
 @app.on_event("startup")
 async def startup():
-    """Pre-load the embedding model so the first request isn't slow."""
     get_embedding_model()
 
     if os.getenv("RUN_EMBED_ON_START") == "1":
-        log.info("RUN_EMBED_ON_START=true — running embed backfill ...")
+        logging.info("RUN_EMBED_ON_START=1 — running embed backfill ...")
         import asyncio
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, lambda: run_embed_all(only_nulls=True))
-        log.info("Embed backfill finished.")
+        logging.info("Embed backfill finished.")
