@@ -207,7 +207,7 @@ async def embed_guide(
     columns) back to guide_profile and Supabase re-fires the UPDATE trigger.
     """
     _verify(x_webhook_secret)
-    guide_id = payload.record.get("id")
+    guide_id = payload.safe_record.get("id")
     if not guide_id:
         raise HTTPException(400, "record.id missing")
 
@@ -220,8 +220,8 @@ async def embed_guide(
             "profile_bio",   # joined from user_profile via fetch_guide_row()
             "active_level",
         )
-        old = payload.old_record or {}
-        rec = payload.record
+        old = payload.safe_old
+        rec = payload.safe_record
         if not any(rec.get(f) != old.get(f) for f in relevant):
             log.info("embed_guide: no embedding-relevant fields changed for guide %s, skipping", guide_id)
             return {"status": "skipped", "reason": "no_embedding_fields_changed", "guide_id": guide_id}
@@ -242,7 +242,7 @@ async def embed_guide_by_specialization(
     What changed: guide added or removed a specialization
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     guide_id = rec.get("guide_profile_id")
     if not guide_id:
         raise HTTPException(400, "record.guide_profile_id missing")
@@ -265,7 +265,7 @@ async def embed_guide_by_user(
     as a second webhook row for the same table in Supabase Dashboard.
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     user_profile_id = rec.get("user_profile_id")
     if not user_profile_id:
         raise HTTPException(400, "record.user_profile_id missing")
@@ -290,14 +290,14 @@ async def embed_guide_by_local_activity(
     guide embedding text actually changed (e.g. only price or date updated).
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     guide_id = rec.get("guide_id")
     if not guide_id:
         return {"status": "skipped", "reason": "no_guide_id_in_record"}
 
     if payload.type == "UPDATE":
         relevant = ("name", "category", "description")
-        old = payload.old_record or {}
+        old = payload.safe_old
         if not any(rec.get(f) != old.get(f) for f in relevant):
             log.info("embed_guide/by-local-activity: no embedding-relevant fields changed, skipping guide %s", guide_id)
             return {"status": "skipped", "reason": "no_embedding_fields_changed", "guide_id": guide_id}
@@ -327,7 +327,7 @@ async def embed_stay(
     writes the embedding vector back to the stay table.
     """
     _verify(x_webhook_secret)
-    stay_id = payload.record.get("id")
+    stay_id = payload.safe_record.get("id")
     if not stay_id:
         raise HTTPException(400, "record.id missing")
 
@@ -337,8 +337,8 @@ async def embed_stay(
             "budget",
             "type",
         )
-        old = payload.old_record or {}
-        rec = payload.record
+        old = payload.safe_old
+        rec = payload.safe_record
         if not any(rec.get(f) != old.get(f) for f in relevant):
             log.info("embed_stay: no embedding-relevant fields changed for stay %s, skipping", stay_id)
             return {"status": "skipped", "reason": "no_embedding_fields_changed", "stay_id": stay_id}
@@ -359,7 +359,7 @@ async def embed_stay_by_ambiance(
     What changed: stay added or removed an ambiance tag
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     stay_id = rec.get("stay_id")
     if not stay_id:
         raise HTTPException(400, "record.stay_id missing")
@@ -379,7 +379,7 @@ async def embed_stay_by_suitable_for(
     What changed: stay added or removed a suitable_for tag
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     stay_id = rec.get("stay_id")
     if not stay_id:
         raise HTTPException(400, "record.stay_id missing")
@@ -404,14 +404,14 @@ async def embed_stay_by_local_activity(
     stay embedding text actually changed (e.g. only price or date updated).
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     host_id = rec.get("host_id")
     if not host_id:
         return {"status": "skipped", "reason": "no_host_id_in_record"}
 
     if payload.type == "UPDATE":
         relevant = ("name", "category", "description")
-        old = payload.old_record or {}
+        old = payload.safe_old
         if not any(rec.get(f) != old.get(f) for f in relevant):
             log.info("embed_stay/by-local-activity: no embedding-relevant fields changed, skipping host %s", host_id)
             return {"status": "skipped", "reason": "no_embedding_fields_changed", "host_id": host_id}
@@ -436,8 +436,8 @@ async def embed_stay_by_host(
     _verify(x_webhook_secret)
 
     # Only re-embed if avg_rating actually changed
-    old = payload.old_record or {}
-    rec = payload.record
+    old = payload.safe_old
+    rec = payload.safe_record
     if rec.get("avg_rating") == old.get("avg_rating"):
         return {"status": "skipped", "reason": "avg_rating_unchanged"}
 
@@ -470,7 +470,7 @@ async def embed_activity(
     upsert_activity_embedding writes the embedding vector back to the activity table.
     """
     _verify(x_webhook_secret)
-    activity_id = payload.record.get("id")
+    activity_id = payload.safe_record.get("id")
     if not activity_id:
         raise HTTPException(400, "record.id missing")
 
@@ -481,8 +481,8 @@ async def embed_activity(
             "difficulty_level",
             "budget",
         )
-        old = payload.old_record or {}
-        rec = payload.record
+        old = payload.safe_old
+        rec = payload.safe_record
         if not any(rec.get(f) != old.get(f) for f in relevant):
             log.info("embed_activity: no embedding-relevant fields changed for activity %s, skipping", activity_id)
             return {"status": "skipped", "reason": "no_embedding_fields_changed", "activity_id": activity_id}
@@ -503,7 +503,7 @@ async def embed_activity_by_suitable_for(
     What changed: activity added or removed a suitable_for tag
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     activity_id = rec.get("activity_id")
     if not activity_id:
         raise HTTPException(400, "record.activity_id missing")
@@ -530,7 +530,7 @@ async def invalidate_tourist(
     Note: these same tables also trigger /embed/guide/by-user.
     """
     _verify(x_webhook_secret)
-    rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
+    rec = payload.safe_record
     user_profile_id = rec.get("user_profile_id")
     if not user_profile_id:
         raise HTTPException(400, "record.user_profile_id missing")
@@ -552,12 +552,12 @@ async def embed_tourist_by_profile(
     Skips re-embed if none of the embedding-relevant fields actually changed.
     """
     _verify(x_webhook_secret)
-    tourist_id = payload.record.get("id")
+    tourist_id = payload.safe_record.get("id")
     if not tourist_id:
         raise HTTPException(400, "record.id missing")
 
-    old = payload.old_record or {}
-    rec = payload.record
+    old = payload.safe_old
+    rec = payload.safe_record
     relevant = ("travel_style", "budget", "active_level")
     if not any(rec.get(f) != old.get(f) for f in relevant):
         return {"status": "skipped", "reason": "no_embedding_fields_changed"}
@@ -590,8 +590,8 @@ async def embed_user_profile_update(
     """
     _verify(x_webhook_secret)
 
-    old = payload.old_record or {}
-    rec = payload.record
+    old = payload.safe_old
+    rec = payload.safe_record
     user_profile_id = rec.get("id")
     if not user_profile_id:
         raise HTTPException(400, "record.id missing")
@@ -629,11 +629,11 @@ async def embed_doc(
     _verify(x_webhook_secret)
 
     if payload.type == "DELETE":
-        old = payload.old_record or {}
+        old = payload.safe_old
         log.info("doc_source '%s' deleted — chunks removed by cascade", old.get("name"))
         return {"status": "ok", "event": "delete"}
 
-    source = payload.record
+    source = payload.safe_record
     if not source.get("is_active", True):
         log.info("doc_source '%s' is inactive, skipping embed", source.get("name"))
         return {"status": "skipped", "reason": "inactive"}

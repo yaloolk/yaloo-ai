@@ -10,18 +10,54 @@ from pydantic import BaseModel, field_validator, Field
 
 
 # ── Supabase DB webhook envelope ────────────────────────────────────────────
+#
+# Supabase sends different nulls depending on the event type:
+#
+#   Event    │ record  │ old_record
+#   ─────────┼─────────┼───────────
+#   INSERT   │ new row │ null
+#   UPDATE   │ new row │ old row
+#   DELETE   │ null    │ old row
+#
+# Both fields must be Optional to avoid 422s on DELETE (record=null)
+# and INSERT (old_record=null) webhooks.
+# Use .safe_record and .safe_old instead of accessing .record / .old_record
+# directly — they always return a plain dict and handle the null cases for you.
 
 class WebhookPayload(BaseModel):
     type: str
     table: str
     # Use an alias to map incoming 'schema' to 'schema_'
     schema_: str = Field(alias="schema")
-    record: Dict[str, Any]
-    old_record: Optional[Dict[str, Any]] = None
+    record: Optional[Dict[str, Any]] = None       # null on DELETE
+    old_record: Optional[Dict[str, Any]] = None   # null on INSERT
 
     class Config:
         # This allows you to still use 'schema_' when creating the object manually
         populate_by_name = True
+
+    @property
+    def safe_record(self) -> Dict[str, Any]:
+        """
+        The authoritative row for this event — never None.
+          INSERT / UPDATE → payload.record   (the new / current row)
+          DELETE          → payload.old_record (the row that was removed)
+        Use this everywhere instead of payload.record directly.
+        """
+        if self.type == "DELETE":
+            return self.old_record or {}
+        return self.record or {}
+
+    @property
+    def safe_old(self) -> Dict[str, Any]:
+        """
+        The previous state of the row — never None.
+          UPDATE → payload.old_record  (values before the change)
+          INSERT → {}  (no previous state)
+          DELETE → {}  (safe_record already holds the row)
+        Use this for change-detection guards: rec.get(f) != old.get(f).
+        """
+        return self.old_record or {}
 
 
 # ── Recommendation request ───────────────────────────────────────────────────
