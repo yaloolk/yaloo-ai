@@ -198,13 +198,34 @@ async def embed_guide(
     """
     Supabase webhook:
       Table: guide_profile | Events: INSERT, UPDATE
-    What changed: any field on guide_profile itself
+    What changed: any embedding-relevant field on guide_profile itself
     (experience_years, rate_per_hour, avg_rating, active_level, city_id, is_available)
+
+    For UPDATE events, skips re-embedding if none of the fields that actually
+    contribute to the guide embedding changed. This prevents an infinite webhook
+    loop when upsert_guide_embedding writes non-embedding fields (e.g. embedding
+    columns) back to guide_profile and Supabase re-fires the UPDATE trigger.
     """
     _verify(x_webhook_secret)
     guide_id = payload.record.get("id")
     if not guide_id:
         raise HTTPException(400, "record.id missing")
+
+    # On UPDATE, only re-embed when an embedding-relevant field actually changed.
+    # Columns that contribute to the guide embedding text (from guide_profile itself).
+    # specializations / interests / languages / local_activities come via their own
+    # junction-table webhooks (INSERT/DELETE only) so they don't need guarding here.
+    if payload.type == "UPDATE":
+        relevant = (
+            "profile_bio",   # joined from user_profile via fetch_guide_row()
+            "active_level",
+        )
+        old = payload.old_record or {}
+        rec = payload.record
+        if not any(rec.get(f) != old.get(f) for f in relevant):
+            log.info("embed_guide: no embedding-relevant fields changed for guide %s, skipping", guide_id)
+            return {"status": "skipped", "reason": "no_embedding_fields_changed", "guide_id": guide_id}
+
     background_tasks.add_task(vector_service.upsert_guide_embedding, guide_id)
     return {"status": "accepted", "guide_id": guide_id}
 
@@ -264,12 +285,23 @@ async def embed_guide_by_local_activity(
     What changed: a guide added/removed/changed a local activity they offer
     Note: local_activity ALSO affects stays (via host_id) — register a second
     webhook on the same table pointing to /embed/stay/by-local-activity.
+
+    On UPDATE, skips re-embedding if none of the fields that contribute to the
+    guide embedding text actually changed (e.g. only price or date updated).
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
     guide_id = rec.get("guide_id")
     if not guide_id:
         return {"status": "skipped", "reason": "no_guide_id_in_record"}
+
+    if payload.type == "UPDATE":
+        relevant = ("name", "category", "description")
+        old = payload.old_record or {}
+        if not any(rec.get(f) != old.get(f) for f in relevant):
+            log.info("embed_guide/by-local-activity: no embedding-relevant fields changed, skipping guide %s", guide_id)
+            return {"status": "skipped", "reason": "no_embedding_fields_changed", "guide_id": guide_id}
+
     background_tasks.add_task(vector_service.upsert_guide_embedding, guide_id)
     return {"status": "accepted", "guide_id": guide_id}
 
@@ -287,12 +319,30 @@ async def embed_stay(
     """
     Supabase webhook:
       Table: stay | Events: INSERT, UPDATE
-    What changed: stay name, type, description, budget, price_per_night, city_id
+    What changed: stay description, budget, or type
+    (suitable_for / ambiance / local_activities come via their own junction-table webhooks)
+
+    On UPDATE, skips re-embedding if none of the fields that contribute to the
+    stay embedding text actually changed, preventing loops when upsert_stay_embedding
+    writes the embedding vector back to the stay table.
     """
     _verify(x_webhook_secret)
     stay_id = payload.record.get("id")
     if not stay_id:
         raise HTTPException(400, "record.id missing")
+
+    if payload.type == "UPDATE":
+        relevant = (
+            "description",
+            "budget",
+            "type",
+        )
+        old = payload.old_record or {}
+        rec = payload.record
+        if not any(rec.get(f) != old.get(f) for f in relevant):
+            log.info("embed_stay: no embedding-relevant fields changed for stay %s, skipping", stay_id)
+            return {"status": "skipped", "reason": "no_embedding_fields_changed", "stay_id": stay_id}
+
     background_tasks.add_task(vector_service.upsert_stay_embedding, stay_id)
     return {"status": "accepted", "stay_id": stay_id}
 
@@ -349,12 +399,23 @@ async def embed_stay_by_local_activity(
     What changed: a host added/removed/changed an activity — affects all their stays
     Note: this is a SECOND webhook row on local_activity in Supabase Dashboard.
     The first points to /embed/guide/by-local-activity.
+
+    On UPDATE, skips re-embedding if none of the fields that contribute to the
+    stay embedding text actually changed (e.g. only price or date updated).
     """
     _verify(x_webhook_secret)
     rec = payload.record if payload.type != "DELETE" else (payload.old_record or payload.record)
     host_id = rec.get("host_id")
     if not host_id:
         return {"status": "skipped", "reason": "no_host_id_in_record"}
+
+    if payload.type == "UPDATE":
+        relevant = ("name", "category", "description")
+        old = payload.old_record or {}
+        if not any(rec.get(f) != old.get(f) for f in relevant):
+            log.info("embed_stay/by-local-activity: no embedding-relevant fields changed, skipping host %s", host_id)
+            return {"status": "skipped", "reason": "no_embedding_fields_changed", "host_id": host_id}
+
     background_tasks.add_task(_bg_embed_stays_by_host, host_id)
     return {"status": "accepted", "host_id": host_id}
 
@@ -401,12 +462,31 @@ async def embed_activity(
     """
     Supabase webhook:
       Table: activity | Events: INSERT, UPDATE
-    What changed: activity name, category, description, budget, difficulty_level, base_price
+    What changed: activity category, description, difficulty_level, or budget
+    (suitable_for comes via its own junction-table webhook)
+
+    On UPDATE, skips re-embedding if none of the fields that contribute to the
+    activity embedding text actually changed, preventing loops when
+    upsert_activity_embedding writes the embedding vector back to the activity table.
     """
     _verify(x_webhook_secret)
     activity_id = payload.record.get("id")
     if not activity_id:
         raise HTTPException(400, "record.id missing")
+
+    if payload.type == "UPDATE":
+        relevant = (
+            "category",
+            "description",
+            "difficulty_level",
+            "budget",
+        )
+        old = payload.old_record or {}
+        rec = payload.record
+        if not any(rec.get(f) != old.get(f) for f in relevant):
+            log.info("embed_activity: no embedding-relevant fields changed for activity %s, skipping", activity_id)
+            return {"status": "skipped", "reason": "no_embedding_fields_changed", "activity_id": activity_id}
+
     background_tasks.add_task(vector_service.upsert_activity_embedding, activity_id)
     return {"status": "accepted", "activity_id": activity_id}
 
