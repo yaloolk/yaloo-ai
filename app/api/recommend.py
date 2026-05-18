@@ -154,12 +154,13 @@ def _bg_embed_guide_by_user(user_profile_id: str) -> None:
 
 
 def _bg_invalidate_tourist(user_profile_id: str) -> None:
-    """Background: invalidate tourist vectors if this user is a tourist."""
+    """Background: eagerly re-embed tourist vectors if this user is a tourist."""
     tourist_id = _tourist_id_from_user(user_profile_id)
     if not tourist_id:
-        log.info("invalidate_tourist: user %s is not a tourist, skipping", user_profile_id)
+        log.info("embed_tourist: user %s is not a tourist, skipping", user_profile_id)
         return
-    vector_service.invalidate_tourist_embedding(tourist_id)
+    vector_service.upsert_tourist_embedding(tourist_id)
+    log.info("embed_tourist: re-embedded tourist %s (t2g, t2s, t2a)", tourist_id)
 
 
 def _bg_embed_stays_by_host(host_id: str) -> None:
@@ -193,8 +194,8 @@ def _bg_embed_user_profile_update(user_profile_id: str, rec: dict, old: dict) ->
     if any(rec.get(f) != old.get(f) for f in tourist_fields):
         tourist_id = _tourist_id_from_user(user_profile_id)
         if tourist_id:
-            vector_service.invalidate_tourist_embedding(tourist_id)
-            log.info("user_profile update: invalidated tourist %s", tourist_id)
+            vector_service.upsert_tourist_embedding(tourist_id)
+            log.info("user_profile update: re-embedded tourist %s (t2g, t2s, t2a)", tourist_id)
         else:
             log.info("user_profile update: user %s is not a tourist", user_profile_id)
 
@@ -582,7 +583,7 @@ async def embed_tourist_by_profile(
     if not any(rec.get(f) != old.get(f) for f in relevant):
         return {"status": "skipped", "reason": "no_embedding_fields_changed"}
 
-    background_tasks.add_task(vector_service.invalidate_tourist_embedding, tourist_id)
+    background_tasks.add_task(vector_service.upsert_tourist_embedding, tourist_id)
     return {"status": "accepted", "tourist_id": tourist_id}
 
 
