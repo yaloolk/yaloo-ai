@@ -71,53 +71,73 @@ def _verify(x_webhook_secret: Optional[str]) -> None:
 
 def _guide_id_from_user(user_profile_id: str) -> Optional[str]:
     """Return guide_profile.id for a user, or None if not a guide."""
-    row = (
-        get_supabase()
-        .table("guide_profile")
-        .select("id")
-        .eq("user_profile_id", user_profile_id)
-        .maybe_single()
-        .execute()
-    ).data
-    return row["id"] if row else None
+    try:
+        res = (
+            get_supabase()
+            .table("guide_profile")
+            .select("id")
+            .eq("user_profile_id", user_profile_id)
+            .maybe_single()
+            .execute()
+        )
+        row = res.data if res else None
+        return row["id"] if row else None
+    except Exception as e:
+        log.warning("_guide_id_from_user(%s) failed: %s", user_profile_id, e)
+        return None
 
 
 def _stay_ids_from_host(host_id: str) -> list:
     """Return all stay.id rows for a given host_id."""
-    rows = (
-        get_supabase()
-        .table("stay")
-        .select("id")
-        .eq("host_id", host_id)
-        .execute()
-    ).data or []
-    return [r["id"] for r in rows]
+    try:
+        res = (
+            get_supabase()
+            .table("stay")
+            .select("id")
+            .eq("host_id", host_id)
+            .execute()
+        )
+        rows = res.data if res else []
+        return [r["id"] for r in (rows or [])]
+    except Exception as e:
+        log.warning("_stay_ids_from_host(%s) failed: %s", host_id, e)
+        return []
 
 
 def _tourist_id_from_user(user_profile_id: str) -> Optional[str]:
     """Return tourist_profile.id for a user, or None if not a tourist."""
-    row = (
-        get_supabase()
-        .table("tourist_profile")
-        .select("id")
-        .eq("user_profile_id", user_profile_id)
-        .maybe_single()
-        .execute()
-    ).data
-    return row["id"] if row else None
+    try:
+        res = (
+            get_supabase()
+            .table("tourist_profile")
+            .select("id")
+            .eq("user_profile_id", user_profile_id)
+            .maybe_single()
+            .execute()
+        )
+        row = res.data if res else None
+        return row["id"] if row else None
+    except Exception as e:
+        log.warning("_tourist_id_from_user(%s) failed: %s", user_profile_id, e)
+        return None
 
 
 def _host_id_from_user(user_profile_id: str) -> Optional[str]:
     """Return host_profile's user_profile_id (host_id) — same value, just confirms they're a host."""
-    row = (
-        get_supabase()
-        .table("host_profile")
-        .select("user_profile_id")
-        .eq("user_profile_id", user_profile_id)
-        .maybe_single()
-        .execute()
-    ).data
-    return row["user_profile_id"] if row else None
+    try:
+        res = (
+            get_supabase()
+            .table("host_profile")
+            .select("user_profile_id")
+            .eq("user_profile_id", user_profile_id)
+            .maybe_single()
+            .execute()
+        )
+        row = res.data if res else None
+        return row["user_profile_id"] if row else None
+    except Exception as e:
+        log.warning("_host_id_from_user(%s) failed: %s", user_profile_id, e)
+        return None
 
 
 # ── Background task helpers ───────────────────────────────────────────────────
@@ -134,13 +154,12 @@ def _bg_embed_guide_by_user(user_profile_id: str) -> None:
 
 
 def _bg_invalidate_tourist(user_profile_id: str) -> None:
-    """Background: eagerly re-embed tourist vectors if this user is a tourist."""
+    """Background: invalidate tourist vectors if this user is a tourist."""
     tourist_id = _tourist_id_from_user(user_profile_id)
     if not tourist_id:
-        log.info("embed_tourist: user %s is not a tourist, skipping", user_profile_id)
+        log.info("invalidate_tourist: user %s is not a tourist, skipping", user_profile_id)
         return
-    vector_service.upsert_tourist_embedding(tourist_id)
-    log.info("embed_tourist: re-embedded tourist %s (t2g, t2s, t2a)", tourist_id)
+    vector_service.invalidate_tourist_embedding(tourist_id)
 
 
 def _bg_embed_stays_by_host(host_id: str) -> None:
@@ -174,8 +193,8 @@ def _bg_embed_user_profile_update(user_profile_id: str, rec: dict, old: dict) ->
     if any(rec.get(f) != old.get(f) for f in tourist_fields):
         tourist_id = _tourist_id_from_user(user_profile_id)
         if tourist_id:
-            vector_service.upsert_tourist_embedding(tourist_id)
-            log.info("user_profile update: re-embedded tourist %s (t2g, t2s, t2a)", tourist_id)
+            vector_service.invalidate_tourist_embedding(tourist_id)
+            log.info("user_profile update: invalidated tourist %s", tourist_id)
         else:
             log.info("user_profile update: user %s is not a tourist", user_profile_id)
 
@@ -563,7 +582,7 @@ async def embed_tourist_by_profile(
     if not any(rec.get(f) != old.get(f) for f in relevant):
         return {"status": "skipped", "reason": "no_embedding_fields_changed"}
 
-    background_tasks.add_task(vector_service.upsert_tourist_embedding, tourist_id)
+    background_tasks.add_task(vector_service.invalidate_tourist_embedding, tourist_id)
     return {"status": "accepted", "tourist_id": tourist_id}
 
 
